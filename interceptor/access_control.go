@@ -5,13 +5,14 @@ import (
 	"strings"
 
 	"github.com/gogo/status"
-	"github.com/temporalio/s2s-proxy/auth"
-	"github.com/temporalio/s2s-proxy/config"
 	"go.temporal.io/server/common/api"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+
+	"github.com/temporalio/s2s-proxy/auth"
+	"github.com/temporalio/s2s-proxy/config"
 )
 
 type (
@@ -40,7 +41,7 @@ func NewAccessControlInterceptor(
 	}
 }
 
-func createNamespaceAccessControl(access *auth.AccessControl) matcher {
+func createNamespaceAccessControl(access *auth.AccessControl) stringMatcher {
 	return func(name string) (string, bool) {
 		var notAllowed bool
 		if access != nil {
@@ -66,8 +67,11 @@ func (i *AccessControlInterceptor) Intercept(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (any, error) {
-	if i.adminServiceAccess == nil || i.namespaceAccess == nil {
-		return handler(ctx, req)
+	if strings.HasPrefix(info.FullMethod, api.WorkflowServicePrefix) {
+		methodName := api.MethodName(info.FullMethod)
+		if !auth.IsAllowedWorkflowMigrationAPIs(methodName) {
+			return nil, status.Errorf(codes.PermissionDenied, "Calling method %s is not allowed.", methodName)
+		}
 	}
 
 	if i.adminServiceAccess != nil && strings.HasPrefix(info.FullMethod, api.AdminServicePrefix) {
@@ -77,8 +81,8 @@ func (i *AccessControlInterceptor) Intercept(
 		}
 	}
 
-	if i.namespaceAccess != nil && strings.HasPrefix(info.FullMethod, api.WorkflowServicePrefix) ||
-		strings.HasPrefix(info.FullMethod, api.AdminServicePrefix) {
+	if i.namespaceAccess != nil &&
+		(strings.HasPrefix(info.FullMethod, api.WorkflowServicePrefix) || strings.HasPrefix(info.FullMethod, api.AdminServicePrefix)) {
 		allowed, err := isNamespaceAccessAllowed(req, i.namespaceAccess)
 		if !allowed || err != nil {
 			methodName := api.MethodName(info.FullMethod)
@@ -92,7 +96,7 @@ func (i *AccessControlInterceptor) Intercept(
 				logger.Error("namespace access control error", tag.Error(err))
 			}
 
-			return nil, status.Errorf(codes.PermissionDenied, "Calling method %s is not allowed.", methodName)
+			return nil, status.Errorf(codes.PermissionDenied, "Calling method %s is not allowed by namespace access control.", methodName)
 		}
 	}
 

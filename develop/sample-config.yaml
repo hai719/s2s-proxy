@@ -29,6 +29,11 @@ inbound:
     allowedNamespaces:
       - namespace1
       - namespace2
+  api_overrides:
+    adminService:
+      DescribeCluster:
+        response:
+          failover_version_increment : 100
 
 outbound:
   name: "outbound-proxy"
@@ -58,4 +63,6 @@ namespaceNameTranslation:
 metrics:
   prometheus:
       framework: "tally"
-      listenAddress: "127.0.0.1:8002"
+      listenAddress: "0.0.0.0:9090"
+profiling:
+  pprofAddress: "localhost:6060"

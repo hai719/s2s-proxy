@@ -7,11 +7,6 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/temporalio/s2s-proxy/client"
-	adminclient "github.com/temporalio/s2s-proxy/client/admin"
-	"github.com/temporalio/s2s-proxy/common"
-	"github.com/temporalio/s2s-proxy/config"
-
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/api/adminservice/v1"
 	"go.temporal.io/server/client/history"
@@ -21,6 +16,12 @@ import (
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"google.golang.org/grpc/metadata"
+
+	"github.com/temporalio/s2s-proxy/client"
+	adminclient "github.com/temporalio/s2s-proxy/client/admin"
+	"github.com/temporalio/s2s-proxy/common"
+	"github.com/temporalio/s2s-proxy/config"
+	"github.com/temporalio/s2s-proxy/metrics"
 )
 
 type (
@@ -49,11 +50,13 @@ func NewAdminServiceProxyServer(
 }
 
 func (s *adminServiceProxyServer) AddOrUpdateRemoteCluster(ctx context.Context, in0 *adminservice.AddOrUpdateRemoteClusterRequest) (*adminservice.AddOrUpdateRemoteClusterResponse, error) {
-	if outbound := s.Config.Outbound; s.IsInbound && outbound != nil && len(outbound.Server.ExternalAddress) > 0 {
-		// Override this address so that cross-cluster connections flow through the proxy.
-		// Use a separate "external address" config option because the outbound.listenerAddress may not be routable
-		// from the local temporal server, or the proxy may be deployed behind a load balancer.
-		in0.FrontendAddress = outbound.Server.ExternalAddress
+	if !common.IsRequestTranslationDisabled(ctx) {
+		if outbound := s.Config.Outbound; s.IsInbound && outbound != nil && len(outbound.Server.ExternalAddress) > 0 {
+			// Override this address so that cross-cluster connections flow through the proxy.
+			// Use a separate "external address" config option because the outbound.listenerAddress may not be routable
+			// from the local temporal server, or the proxy may be deployed behind a load balancer.
+			in0.FrontendAddress = outbound.Server.ExternalAddress
+		}
 	}
 	return s.adminClient.AddOrUpdateRemoteCluster(ctx, in0)
 }
@@ -80,8 +83,26 @@ func (s *adminServiceProxyServer) DeleteWorkflowExecution(ctx context.Context, i
 
 func (s *adminServiceProxyServer) DescribeCluster(ctx context.Context, in0 *adminservice.DescribeClusterRequest) (*adminservice.DescribeClusterResponse, error) {
 	resp, err := s.adminClient.DescribeCluster(ctx, in0)
-	if err != nil {
+	if common.IsRequestTranslationDisabled(ctx) {
 		return resp, err
+	}
+
+	var overrides *config.APIOverridesConfig
+	if s.IsInbound {
+		if s.Config.Inbound != nil {
+			overrides = s.Config.Inbound.APIOverrides
+		}
+	} else {
+		if s.Config.Outbound != nil {
+			overrides = s.Config.Outbound.APIOverrides
+		}
+	}
+
+	if overrides != nil && overrides.AdminSerivce.DescribeCluster != nil {
+		responseOverride := overrides.AdminSerivce.DescribeCluster.Response
+		if resp != nil && responseOverride.FailoverVersionIncrement != nil {
+			resp.FailoverVersionIncrement = *responseOverride.FailoverVersionIncrement
+		}
 	}
 
 	if cfg := s.Config.ShardCountConfig; cfg.Mode == config.ShardCountLCM {
@@ -89,6 +110,7 @@ func (s *adminServiceProxyServer) DescribeCluster(ctx context.Context, in0 *admi
 		// common multiple of both cluster shard counts.
 		resp.HistoryShardCount = common.LCM(cfg.RemoteShardCount, cfg.LocalShardCount)
 	}
+
 	return resp, err
 }
 
@@ -237,7 +259,15 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 		tag.NewStringTag("server", ClusterShardIDtoString(serverShardID)),
 	)
 
+	// Record streams active
+	directionLabel := "inbound"
+	if !s.IsInbound {
+		directionLabel = "outbound"
+	}
 	logger.Info("AdminStreamReplicationMessages started.")
+	streamsActiveGauge := metrics.AdminServiceStreamsActive.WithLabelValues(directionLabel)
+	streamsActiveGauge.Inc()
+	defer streamsActiveGauge.Dec()
 	defer logger.Info("AdminStreamReplicationMessages stopped.")
 
 	if cfg := s.Config.ShardCountConfig; cfg.Mode == config.ShardCountLCM {
@@ -302,6 +332,7 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 		for !shutdownChan.IsShutdown() {
 			req, err := targetStreamServer.Recv()
 			if err == io.EOF {
+				logger.Info("targetStreamServer.Recv encountered EOF", tag.Error(err))
 				return
 			}
 
@@ -314,7 +345,11 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 			case *adminservice.StreamWorkflowReplicationMessagesRequest_SyncReplicationState:
 				logger.Debug(fmt.Sprintf("forwarding SyncReplicationState: inclusive %v", attr.SyncReplicationState.InclusiveLowWatermark))
 				if err = sourceStreamClient.Send(req); err != nil {
-					logger.Error("sourceStreamClient.Send encountered error", tag.Error(err))
+					if err != io.EOF {
+						logger.Error("sourceStreamClient.Send encountered error", tag.Error(err))
+					} else {
+						logger.Info("sourceStreamClient.Send encountered EOF", tag.Error(err))
+					}
 					return
 				}
 			default:
@@ -345,6 +380,7 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 		for !shutdownChan.IsShutdown() {
 			resp, err := sourceStreamClient.Recv()
 			if err == io.EOF {
+				logger.Info("sourceStreamClient.Recv encountered EOF", tag.Error(err))
 				return
 			}
 
@@ -358,7 +394,8 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 				if err = targetStreamServer.Send(resp); err != nil {
 					if err != io.EOF {
 						logger.Error("targetStreamServer.Send encountered error", tag.Error(err))
-
+					} else {
+						logger.Info("targetStreamServer.Send encountered EOF", tag.Error(err))
 					}
 					return
 				}

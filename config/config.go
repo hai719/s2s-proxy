@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/temporalio/s2s-proxy/encryption"
 	"github.com/urfave/cli/v2"
 	"gopkg.in/yaml.v3"
+
+	"github.com/temporalio/s2s-proxy/encryption"
 )
 
 const (
 	ConfigPathFlag = "config"
 	LogLevelFlag   = "level"
+
+	DefaultPProfAddress = "localhost:6060"
 )
 
 type TransportType string
@@ -74,11 +77,28 @@ type (
 		MuxTransportName string `yaml:"mux"`
 	}
 
+	DescribeClusterResponseOverrides struct {
+		FailoverVersionIncrement *int64 `yaml:"failover_version_increment,omitempty"`
+	}
+
+	DescribeClusterOverride struct {
+		Response DescribeClusterResponseOverrides `yaml:"response"`
+	}
+
+	AdminServiceOverrides struct {
+		DescribeCluster *DescribeClusterOverride `yaml:"DescribeCluster"`
+	}
+
+	APIOverridesConfig struct {
+		AdminSerivce AdminServiceOverrides `yaml:"adminService"`
+	}
+
 	ProxyConfig struct {
-		Name      string            `yaml:"name"`
-		Server    ProxyServerConfig `yaml:"server"`
-		Client    ProxyClientConfig `yaml:"client"`
-		ACLPolicy *ACLPolicy        `yaml:"aclPolicy"`
+		Name         string              `yaml:"name"`
+		Server       ProxyServerConfig   `yaml:"server"`
+		Client       ProxyClientConfig   `yaml:"client"`
+		ACLPolicy    *ACLPolicy          `yaml:"aclPolicy"`
+		APIOverrides *APIOverridesConfig `yaml:"api_overrides"`
 	}
 
 	MuxTransportConfig struct {
@@ -94,16 +114,37 @@ type (
 	}
 
 	S2SProxyConfig struct {
-		Inbound                  *ProxyConfig                   `yaml:"inbound"`
-		Outbound                 *ProxyConfig                   `yaml:"outbound"`
-		MuxTransports            []MuxTransportConfig           `yaml:"mux"`
-		HealthCheck              *HealthCheckConfig             `yaml:"healthCheck"`
-		NamespaceNameTranslation NamespaceNameTranslationConfig `yaml:"namespaceNameTranslation"`
-		ShardCountConfig         ShardCountConfig               `yaml:"shardCount"`
-		Metrics                  *MetricsConfig                 `yaml:"metrics"`
+		Inbound                    *ProxyConfig          `yaml:"inbound"`
+		Outbound                   *ProxyConfig          `yaml:"outbound"`
+		MuxTransports              []MuxTransportConfig  `yaml:"mux"`
+		HealthCheck                *HealthCheckConfig    `yaml:"healthCheck"`
+		NamespaceNameTranslation   NameTranslationConfig `yaml:"namespaceNameTranslation"`
+		SearchAttributeTranslation SATranslationConfig   `yaml:"searchAttributeTranslation"`
+		ShardCountConfig           ShardCountConfig      `yaml:"shardCount"`
+		Metrics                    *MetricsConfig        `yaml:"metrics"`
+		ProfilingConfig            ProfilingConfig       `yaml:"profiling"`
 	}
 
-	NamespaceNameTranslationConfig struct {
+	SATranslationConfig struct {
+		NamespaceMappings []SANamespaceMapping `yaml:"namespaceMappings"`
+	}
+
+	SANamespaceMapping struct {
+		Name        string      `yaml:"name"`
+		NamespaceId string      `yaml:"namespaceId"`
+		Mappings    []SAMapping `yaml:"mappings"`
+	}
+
+	SAMapping struct {
+		LocalName  string `yaml:"localFieldName"`
+		RemoteName string `yaml:"remoteFieldName"`
+	}
+
+	ProfilingConfig struct {
+		PProfHTTPAddress string `yaml:"pprofAddress"`
+	}
+
+	NameTranslationConfig struct {
 		Mappings []NameMappingConfig `yaml:"mappings"`
 	}
 
@@ -150,12 +191,30 @@ func (c ProxyClientConfig) IsTCP() bool {
 	return c.Type == TCPTransport
 }
 
+func (c *ProxyClientConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	// Set default
+	c.Type = TCPTransport
+
+	// Alias to avoid infinite recursion
+	type plain ProxyClientConfig
+	return unmarshal((*plain)(c))
+}
+
 func (c ProxyServerConfig) IsMux() bool {
 	return c.Type == MuxTransport
 }
 
 func (c ProxyServerConfig) IsTCP() bool {
 	return c.Type == TCPTransport
+}
+
+func (c *ProxyServerConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	// Set default
+	c.Type = TCPTransport
+
+	// Alias to avoid infinite recursion
+	type plain ProxyServerConfig
+	return unmarshal((*plain)(c))
 }
 
 func newConfigProvider(ctx *cli.Context) (ConfigProvider, error) {
@@ -252,4 +311,75 @@ func NewMockConfigProvider(config S2SProxyConfig) *MockConfigProvider {
 
 func (mc *MockConfigProvider) GetS2SProxyConfig() S2SProxyConfig {
 	return mc.config
+}
+
+func (n NameTranslationConfig) IsEnabled() bool {
+	return len(n.Mappings) > 0
+}
+
+// ToMaps returns request and response mappings.
+func (n NameTranslationConfig) ToMaps(inBound bool) (map[string]string, map[string]string) {
+	reqMap := make(map[string]string)
+	respMap := make(map[string]string)
+	if inBound {
+		// For inbound listener,
+		//   - incoming requests from remote server are modifed to match local server
+		//   - outgoing responses to local server are modified to match remote server
+		for _, tr := range n.Mappings {
+			reqMap[tr.RemoteName] = tr.LocalName
+			respMap[tr.LocalName] = tr.RemoteName
+		}
+	} else {
+		// For outbound listener,
+		//   - incoming requests from local server are modifed to match remote server
+		//   - outgoing responses to remote server are modified to match local server
+		for _, tr := range n.Mappings {
+			reqMap[tr.LocalName] = tr.RemoteName
+			respMap[tr.RemoteName] = tr.LocalName
+		}
+	}
+	return reqMap, respMap
+}
+
+func (c *ProfilingConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	if len(c.PProfHTTPAddress) == 0 {
+		c.PProfHTTPAddress = DefaultPProfAddress
+	}
+
+	// Alias to avoid infinite recursion
+	type plain ProfilingConfig
+	return unmarshal((*plain)(c))
+}
+
+func (s SATranslationConfig) IsEnabled() bool {
+	return len(s.NamespaceMappings) > 0
+}
+
+// ToMaps returns request and response mappings.
+func (s SATranslationConfig) ToMaps(inBound bool) (map[string]map[string]string, map[string]map[string]string) {
+	reqMap := make(map[string]map[string]string)
+	respMap := make(map[string]map[string]string)
+	for _, ns := range s.NamespaceMappings {
+		reqMap[ns.NamespaceId] = make(map[string]string, len(ns.Mappings))
+		respMap[ns.NamespaceId] = make(map[string]string, len(ns.Mappings))
+
+		if inBound {
+			// For inbound listener,
+			//   - incoming requests from remote server are modifed to match local server
+			//   - outgoing responses to local server are modified to match remote server
+			for _, tr := range ns.Mappings {
+				reqMap[ns.NamespaceId][tr.RemoteName] = tr.LocalName
+				respMap[ns.NamespaceId][tr.LocalName] = tr.RemoteName
+			}
+		} else {
+			// For outbound listener,
+			//   - incoming requests from local server are modifed to match remote server
+			//   - outgoing responses to remote server are modified to match local server
+			for _, tr := range ns.Mappings {
+				reqMap[ns.NamespaceId][tr.LocalName] = tr.RemoteName
+				respMap[ns.NamespaceId][tr.RemoteName] = tr.LocalName
+			}
+		}
+	}
+	return reqMap, respMap
 }
