@@ -99,12 +99,8 @@ func makeServerOptions(
 	unaryInterceptors := []grpc.UnaryServerInterceptor{}
 	streamInterceptors := []grpc.StreamServerInterceptor{}
 
-	directionValue := "inbound"
-	if !proxyOpts.IsInbound {
-		directionValue = "outbound"
-	}
 	labelGenerator := grpcprom.WithLabelsFromContext(func(_ context.Context) (labels prometheus.Labels) {
-		return prometheus.Labels{"direction": directionValue}
+		return prometheus.Labels{"direction": proxyOpts.directionLabel()}
 	})
 
 	// Ordering matters! These metrics happen BEFORE the translations/acl
@@ -176,7 +172,12 @@ func (ps *ProxyServer) startServer(
 		return err
 	}
 
-	clientFactory := client.NewClientFactory(clientTransport, logger)
+	clientMetrics := metrics.GRPCOutboundClientMetrics
+	if ps.opts.IsInbound {
+		clientMetrics = metrics.GRPCInboundClientMetrics
+	}
+
+	clientFactory := client.NewClientFactory(clientTransport, clientMetrics, logger)
 	clientProvider := client.NewClientProvider(cfg.Client, clientFactory, logger)
 	ps.adminClient = adminclient.NewLazyClient(clientProvider)
 	ps.server = NewTemporalAPIServer(
@@ -217,6 +218,14 @@ func monitorClosable(closable transport.Closable, retryCh chan struct{}, shutDow
 	}
 }
 
+func (opts *proxyOptions) directionLabel() string {
+	directionValue := "outbound"
+	if opts.IsInbound {
+		directionValue = "inbound"
+	}
+	return directionValue
+}
+
 func (ps *ProxyServer) start() error {
 	serverConfig := ps.config.Server
 	clientConfig := ps.config.Client
@@ -227,7 +236,8 @@ func (ps *ProxyServer) start() error {
 		for {
 			// If using mux transport underneath, Open call will be blocked until
 			// underlying connection is established.
-			clientTransport, err := ps.transManager.OpenClient(clientConfig)
+			// Also note: GRPC requires the client interceptors (like metrics) to be defined on the transport, not on the client.
+			clientTransport, err := ps.transManager.OpenClient(prometheus.Labels{"direction": ps.opts.directionLabel()}, clientConfig)
 			if err != nil {
 				ps.logger.Error("Open client transport is failed", tag.Error(err))
 				ps.stopServer()
