@@ -2,6 +2,7 @@ package transport
 
 import (
 	"fmt"
+	"time"
 
 	"go.temporal.io/server/common/log"
 	"google.golang.org/grpc"
@@ -27,6 +28,31 @@ type (
 		ClientTransport
 		ServerTransport
 		Closable
+	}
+
+	// StreamInfo represents information about an active gRPC stream
+	StreamInfo struct {
+		ID          string    `json:"id"`
+		Method      string    `json:"method"`
+		Direction   string    `json:"direction"`
+		ClientShard string    `json:"client_shard"`
+		ServerShard string    `json:"server_shard"`
+		StartTime   time.Time `json:"start_time"`
+		LastSeen    time.Time `json:"last_seen"`
+	}
+
+	// ConnectionInfo represents debug information about a connection
+	ConnectionInfo struct {
+		Name          string       `json:"name"`
+		Type          string       `json:"type"`
+		Status        string       `json:"status"`
+		LocalAddr     string       `json:"local_addr,omitempty"`
+		RemoteAddr    string       `json:"remote_addr,omitempty"`
+		Connected     bool         `json:"connected"`
+		StartTime     time.Time    `json:"start_time,omitempty"`
+		LastSeen      time.Time    `json:"last_seen,omitempty"`
+		Streams       int          `json:"streams,omitempty"`
+		ActiveStreams []StreamInfo `json:"active_streams,omitempty"`
 	}
 
 	TransportManager struct {
@@ -95,4 +121,16 @@ func (tm *TransportManager) Stop() {
 	for _, cm := range tm.muxConnManagers {
 		cm.stop()
 	}
+}
+
+// GetConnectionInfo returns debug information about all active connections
+func (tm *TransportManager) GetConnectionInfo() []ConnectionInfo {
+	var connections []ConnectionInfo
+
+	for name, manager := range tm.muxConnManagers {
+		info := manager.getConnectionInfo(name)
+		connections = append(connections, info...)
+	}
+
+	return connections
 }

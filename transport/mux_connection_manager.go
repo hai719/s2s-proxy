@@ -47,6 +47,7 @@ type (
 		wg           sync.WaitGroup
 		logger       log.Logger
 		status       atomic.Int32
+		startTime    time.Time // when the connection was established
 	}
 )
 
@@ -162,6 +163,7 @@ func (m *muxConnectMananger) serverLoop(setting config.TCPServerSetting) error {
 				}
 
 				m.muxTransport = newMuxTransport(conn, session)
+				m.startTime = time.Now()
 				m.waitForReconnect()
 			}
 		}
@@ -226,6 +228,7 @@ func (m *muxConnectMananger) clientLoop(setting config.TCPClientSetting) error {
 				}
 
 				m.muxTransport = newMuxTransport(conn, session)
+				m.startTime = time.Now()
 				m.waitForReconnect()
 			}
 		}
@@ -317,6 +320,64 @@ func (m *muxConnectMananger) stop() {
 	close(m.shutdownCh)
 	m.wg.Wait()
 	m.logger.Info("Connection manager stopped")
+}
+
+// getConnectionInfo returns debug information about this connection manager
+func (m *muxConnectMananger) getConnectionInfo(name string) []ConnectionInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var connections []ConnectionInfo
+
+	statusStr := "unknown"
+	connected := false
+	var localAddr, remoteAddr string
+	var streams int
+	var activeStreams []StreamInfo
+
+	switch status(m.status.Load()) {
+	case statusInitialized:
+		statusStr = "initialized"
+	case statusStarted:
+		statusStr = "started"
+		// Check if we have an active connection
+		select {
+		case <-m.connectedCh:
+			connected = true
+			if m.muxTransport != nil && !m.muxTransport.session.IsClosed() {
+				statusStr = "connected"
+				if m.muxTransport.conn != nil {
+					localAddr = m.muxTransport.conn.LocalAddr().String()
+					remoteAddr = m.muxTransport.conn.RemoteAddr().String()
+				}
+				streams = m.muxTransport.session.NumStreams()
+			}
+		default:
+			statusStr = "connecting"
+		}
+	case statusStopped:
+		statusStr = "stopped"
+	}
+
+	// Get active streams from global tracker
+	// Note: This requires importing the proxy package which would create circular dependency
+	// For now, we'll just use the yamux stream count
+	// TODO: Consider a better architecture to avoid circular imports
+
+	connections = append(connections, ConnectionInfo{
+		Name:          name,
+		Type:          "mux",
+		Status:        statusStr,
+		LocalAddr:     localAddr,
+		RemoteAddr:    remoteAddr,
+		Connected:     connected,
+		StartTime:     m.startTime,
+		LastSeen:      time.Now(), // For now, just use current time
+		Streams:       streams,
+		ActiveStreams: activeStreams, // Empty for now due to circular import
+	})
+
+	return connections
 }
 
 func (m *muxConnectMananger) waitForReconnect() {

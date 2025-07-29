@@ -383,3 +383,8 @@ func (s *Proxy) Stop() {
 	}
 	s.transManager.Stop()
 }
+
+// GetConnectionInfo returns debug information about active connections
+func (s *Proxy) GetConnectionInfo() []transport.ConnectionInfo {
+	return s.transManager.GetConnectionInfo()
+}

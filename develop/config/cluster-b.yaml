@@ -5,12 +5,12 @@ log:
 # persistence:
 #   defaultStore: sqlite-default
 #   visibilityStore: sqlite-visibility
-#   numHistoryShards: 2
+#   numHistoryShards: 3
 #   datastores:
 #     sqlite-default:
 #       sql:
 #         pluginName: "sqlite"
-#         databaseName: "default-a"
+#         databaseName: "default-b"
 #         connectAddr: "localhost"
 #         connectProtocol: "tcp"
 #         connectAttributes:
@@ -27,7 +27,7 @@ log:
 #     sqlite-visibility:
 #       sql:
 #         pluginName: "sqlite"
-#         databaseName: "default-vis-a"
+#         databaseName: "default-vis-b"
 #         connectAddr: "localhost"
 #         connectProtocol: "tcp"
 #         connectAttributes:
@@ -43,12 +43,12 @@ log:
 persistence:
   defaultStore: cass-default
   visibilityStore: es-visibility
-  numHistoryShards: 2
+  numHistoryShards: 3
   datastores:
     cass-default:
       cassandra:
         hosts: "127.0.0.1"
-        keyspace: "temporal_cluster_a"
+        keyspace: "temporal_cluster_b"
     es-visibility:
       elasticsearch:
         version: "v7"
@@ -57,7 +57,7 @@ persistence:
           scheme: "http"
           host: "127.0.0.1:9200"
         indices:
-          visibility: temporal_visibility_v1_dev_cluster_a
+          visibility: temporal_visibility_v1_dev_cluster_b
           # secondary_visibility: temporal_visibility_v2_dev
         closeIdleConnectionsInterval: 15s
 
@@ -66,52 +66,52 @@ global:
     maxJoinDuration: 30s
     broadcastAddress: "127.0.0.1"
   pprof:
-    port: 7936
+    port: 8936
   metrics:
     prometheus:
 #      # specify framework to use new approach for initializing metrics and/or use opentelemetry
 #      framework: "opentelemetry"
       framework: "tally"
       timerType: "histogram"
-      listenAddress: "127.0.0.1:8000"
+      listenAddress: "127.0.0.1:8001"
 
 services:
   frontend:
     rpc:
-      grpcPort: 7233
-      membershipPort: 6933
+      grpcPort: 8233
+      membershipPort: 8933
       bindOnLocalHost: true
-      httpPort: 7243
+      httpPort: 8243
 
   matching:
     rpc:
-      grpcPort: 7235
-      membershipPort: 6935
+      grpcPort: 8235
+      membershipPort: 8935
       bindOnLocalHost: true
 
   history:
     rpc:
-      grpcPort: 7234
-      membershipPort: 6934
+      grpcPort: 8234
+      membershipPort: 8934
       bindOnLocalHost: true
 
   worker:
     rpc:
-      grpcPort: 7239
-      membershipPort: 6939
+      grpcPort: 8239
+      membershipPort: 8939
       bindOnLocalHost: true
 
 clusterMetadata:
   enableGlobalNamespace: true
   failoverVersionIncrement: 1000000
-  masterClusterName: "cluster-a"
-  currentClusterName: "cluster-a"
+  masterClusterName: "cluster-b"
+  currentClusterName: "cluster-b"
   clusterInformation:
-    cluster-a:
+    cluster-b:
       enabled: true
-      initialFailoverVersion: 9
+      initialFailoverVersion: 10 
       rpcName: "frontend"
-      rpcAddress: "localhost:7233"
+      rpcAddress: "localhost:8233"
 
 dcRedirectionPolicy:
   policy: "all-apis-forwarding"

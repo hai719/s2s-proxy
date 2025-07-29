@@ -6,6 +6,7 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/api/adminservice/v1"
@@ -105,7 +106,7 @@ func (s *adminServiceProxyServer) DescribeCluster(ctx context.Context, in0 *admi
 		}
 	}
 
-	if cfg := s.Config.ShardCountConfig; cfg.Mode == config.ShardCountLCM {
+	if cfg := s.Config.ShardCountConfig; cfg.Mode == config.ShardCountLCM && resp != nil {
 		// Present a fake number of shards. In LCM mode, we present the least
 		// common multiple of both cluster shard counts.
 		resp.HistoryShardCount = common.LCM(cfg.RemoteShardCount, cfg.LocalShardCount)
@@ -268,6 +269,24 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	streamsActiveGauge := metrics.AdminServiceStreamsActive.WithLabelValues(directionLabel)
 	streamsActiveGauge.Inc()
 	defer streamsActiveGauge.Dec()
+
+	// Register stream with tracker for debugging
+	streamID := fmt.Sprintf("%s-%s-%s-%d",
+		ClusterShardIDtoString(clientShardID),
+		ClusterShardIDtoString(serverShardID),
+		directionLabel,
+		time.Now().UnixNano(),
+	)
+	streamTracker := GetGlobalStreamTracker()
+	streamTracker.RegisterStream(
+		streamID,
+		"StreamWorkflowReplicationMessages",
+		directionLabel,
+		ClusterShardIDtoString(clientShardID),
+		ClusterShardIDtoString(serverShardID),
+	)
+	defer streamTracker.UnregisterStream(streamID)
+
 	defer logger.Info("AdminStreamReplicationMessages stopped.")
 
 	if cfg := s.Config.ShardCountConfig; cfg.Mode == config.ShardCountLCM {
@@ -290,8 +309,8 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 			// Stream is going to local server. Remap shard id by local server shard count.
 			newServerShardID.ShardID = mapShardIDUnique(LCM, cfg.LocalShardCount, serverShardID.ShardID)
 		} else {
-			// Stream is going to remote server. Remap shard id by remote server shard count.
-			newServerShardID.ShardID = mapShardIDUnique(LCM, cfg.RemoteShardCount, serverShardID.ShardID)
+			// Stream is going to remote server.
+			newServerShardID.ShardID = serverShardID.ShardID
 		}
 
 		logger = log.With(logger,
@@ -341,6 +360,8 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 				return
 			}
 
+			streamTracker.UpdateStream(streamID)
+
 			switch attr := req.GetAttributes().(type) {
 			case *adminservice.StreamWorkflowReplicationMessagesRequest_SyncReplicationState:
 				logger.Debug(fmt.Sprintf("forwarding SyncReplicationState: inclusive %v", attr.SyncReplicationState.InclusiveLowWatermark))
@@ -388,6 +409,9 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 				logger.Error("sourceStreamClient.Recv encountered error", tag.Error(err))
 				return
 			}
+
+			streamTracker.UpdateStream(streamID)
+
 			switch attr := resp.GetAttributes().(type) {
 			case *adminservice.StreamWorkflowReplicationMessagesResponse_Messages:
 				logger.Debug(fmt.Sprintf("forwarding ReplicationMessages: exclusive %v", attr.Messages.ExclusiveHighWatermark))
