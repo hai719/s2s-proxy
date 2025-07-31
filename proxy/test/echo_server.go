@@ -108,9 +108,12 @@ func newEchoServer(
 		}
 
 		configProvider := config.NewMockConfigProvider(*localClusterInfo.s2sProxyConfig)
+		// Create noop shard manager for tests
+		shardManager, _ := s2sproxy.NewShardManager(configProvider, logger)
 		proxy = s2sproxy.NewProxy(
 			configProvider,
 			transport.NewTransportManager(configProvider, logger),
+			shardManager,
 			logger,
 		)
 

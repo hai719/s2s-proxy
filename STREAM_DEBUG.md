@@ -49,7 +49,36 @@ The endpoint returns JSON with the following structure:
       "last_seen": "2024-01-15T10:29:59Z"
     }
   ],
-  "stream_count": 1
+  "stream_count": 1,
+  "shard_info": {
+    "enabled": true,
+    "forwarding_enabled": true,
+    "node_name": "proxy-node-1",
+    "local_shards": [
+      {
+        "cluster_id": 1,
+        "shard_id": 0
+      },
+      {
+        "cluster_id": 1,
+        "shard_id": 3
+      }
+    ],
+    "local_shard_count": 2,
+    "cluster_nodes": ["proxy-node-1", "proxy-node-2", "proxy-node-3"],
+    "cluster_size": 3,
+    "remote_shards": {
+      "1:1": "proxy-node-2",
+      "1:2": "proxy-node-2", 
+      "1:4": "proxy-node-3",
+      "1:5": "proxy-node-3"
+    },
+    "remote_shard_counts": {
+      "proxy-node-1": 2,
+      "proxy-node-2": 2,
+      "proxy-node-3": 2
+    }
+  }
 }
 ```
 
@@ -70,6 +99,17 @@ The endpoint returns JSON with the following structure:
 - `method`: gRPC method name (e.g., StreamWorkflowReplicationMessages)
 - `direction`: Stream direction (inbound/outbound)
 - `client_shard`/`server_shard`: Cluster shard identifiers
+
+### Shard Information
+- `enabled`: Whether memberlist shard management is enabled
+- `forwarding_enabled`: Whether proxy-to-proxy forwarding is enabled
+- `node_name`: This proxy instance's node name in the cluster  
+- `local_shards`: Array of shards currently handled by this proxy
+- `local_shard_count`: Number of shards handled locally
+- `cluster_nodes`: All active proxy nodes in the cluster
+- `cluster_size`: Total number of proxy nodes in the cluster
+- `remote_shards`: Map of shard identifiers to the proxy node that owns them (format: "cluster_id:shard_id" -> "node_name")
+- `remote_shard_counts`: Map of proxy node names to the number of shards each node is currently handling
 - `start_time`: When the stream was initiated
 - `last_seen`: Last activity timestamp
 
@@ -80,4 +120,17 @@ The proxy tracks stream activity by:
 2. Updating `last_seen` timestamp on each message received/sent
 3. Unregistering streams when they complete
 
-This provides real-time visibility into active replication streams for debugging and monitoring purposes. 
+This provides real-time visibility into active replication streams for debugging and monitoring purposes.
+
+## Distributed Shard Management
+
+When memberlist is enabled, the proxy provides distributed shard ownership tracking:
+
+- **Local Shards**: Shards currently handled by this proxy instance
+- **Remote Shards**: Real-time view of which proxy nodes own specific shards across the cluster
+- **Shard Counts**: Total number of shards handled by each proxy node in the cluster
+
+This information is useful for:
+- Understanding shard distribution across the proxy cluster
+- Debugging proxy-to-proxy forwarding issues
+- Monitoring cluster health and load balancing

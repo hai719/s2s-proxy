@@ -29,6 +29,7 @@ type (
 		logger       log.Logger
 		server       *TemporalAPIServer
 		transManager *transport.TransportManager
+		shardManager ShardManager
 		shutDownCh   chan struct{}
 	}
 
@@ -39,6 +40,7 @@ type (
 		inboundServer     *ProxyServer
 		healthCheckServer *http.Server
 		metricsServer     *http.Server
+		shardManager      ShardManager
 		logger            log.Logger
 	}
 
@@ -137,7 +139,7 @@ func (ps *ProxyServer) startServer(
 	ps.server = NewTemporalAPIServer(
 		cfg.Name,
 		cfg.Server,
-		NewAdminServiceProxyServer(cfg.Name, cfg.Client, clientFactory, opts, logger),
+		NewAdminServiceProxyServer(cfg.Name, cfg.Client, clientFactory, ps.shardManager, opts, logger),
 		NewWorkflowServiceProxyServer(cfg.Name, cfg.Client, clientFactory, ps.makeNamespaceACL(), logger),
 		serverOpts,
 		serverTransport,
@@ -225,12 +227,14 @@ func newProxyServer(
 	cfg config.ProxyConfig,
 	opts proxyOptions,
 	transManager *transport.TransportManager,
+	shardManager ShardManager,
 	logger log.Logger,
 ) *ProxyServer {
 	return &ProxyServer{
 		config:       cfg,
 		opts:         opts,
 		transManager: transManager,
+		shardManager: shardManager,
 		logger:       logger,
 		shutDownCh:   make(chan struct{}),
 	}
@@ -239,12 +243,14 @@ func newProxyServer(
 func NewProxy(
 	configProvider config.ConfigProvider,
 	transManager *transport.TransportManager,
+	shardManager ShardManager,
 	logger log.Logger,
 ) *Proxy {
 	s2sConfig := configProvider.GetS2SProxyConfig()
 	proxy := &Proxy{
 		config:       s2sConfig,
 		transManager: transManager,
+		shardManager: shardManager,
 		logger:       logger,
 	}
 
@@ -262,6 +268,7 @@ func NewProxy(
 				Config:    s2sConfig,
 			},
 			transManager,
+			shardManager,
 			logger,
 		)
 	}
@@ -274,6 +281,7 @@ func NewProxy(
 				Config:    s2sConfig,
 			},
 			transManager,
+			shardManager,
 			logger,
 		)
 	}
@@ -346,6 +354,11 @@ func (s *Proxy) Start() error {
 			` it needs at least the following path: metrics.prometheus.listenAddress`)
 	}
 
+	// Start shard manager if enabled
+	if err := s.shardManager.Start(); err != nil {
+		return err
+	}
+
 	if err := s.transManager.Start(); err != nil {
 		return err
 	}
@@ -382,9 +395,17 @@ func (s *Proxy) Stop() {
 		s.outboundServer.stop()
 	}
 	s.transManager.Stop()
+
+	// Stop shard manager
+	s.shardManager.Stop()
 }
 
 // GetConnectionInfo returns debug information about active connections
 func (s *Proxy) GetConnectionInfo() []transport.ConnectionInfo {
 	return s.transManager.GetConnectionInfo()
+}
+
+// GetShardInfo returns debug information about shard distribution
+func (s *Proxy) GetShardInfo() ShardDebugInfo {
+	return s.shardManager.GetShardInfo()
 }

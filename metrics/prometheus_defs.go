@@ -34,6 +34,18 @@ var (
 		muxSessionLabels...)
 	MuxObserverReportCount = DefaultCounterVec("mux_observer_report_count", "Number of observer executions",
 		muxSessionLabels...)
+
+	// ShardDistributionGauge tracks how many shards each proxy instance is handling
+	ShardDistributionGauge = DefaultGaugeVec("shard_distribution", "Number of shards handled by each proxy instance", "proxy_node")
+
+	// ShardForwardingCounter tracks shard forwarding operations
+	ShardForwardingCounter = DefaultCounterVec("shard_forwarding_total", "Total number of shard forwarding operations", "from_node", "to_node", "result")
+
+	// MemberlistClusterSizeGauge tracks the size of the memberlist cluster
+	MemberlistClusterSizeGauge = DefaultGauge("memberlist_cluster_size", "Number of nodes in the memberlist cluster")
+
+	// MemberlistEventsCounter tracks memberlist events
+	MemberlistEventsCounter = DefaultCounterVec("memberlist_events_total", "Total number of memberlist events", "event_type")
 )
 
 func init() {

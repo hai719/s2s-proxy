@@ -16,6 +16,8 @@ import (
 	"go.temporal.io/server/common/headers"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 
 	"github.com/temporalio/s2s-proxy/client"
@@ -28,8 +30,9 @@ import (
 type (
 	adminServiceProxyServer struct {
 		adminservice.UnimplementedAdminServiceServer
-		adminClient adminservice.AdminServiceClient
-		logger      log.Logger
+		adminClient  adminservice.AdminServiceClient
+		shardManager ShardManager
+		logger       log.Logger
 		proxyOptions
 	}
 )
@@ -38,6 +41,7 @@ func NewAdminServiceProxyServer(
 	serviceName string,
 	clientConfig config.ProxyClientConfig,
 	clientFactory client.ClientFactory,
+	shardManager ShardManager,
 	opts proxyOptions,
 	logger log.Logger,
 ) adminservice.AdminServiceServer {
@@ -45,6 +49,7 @@ func NewAdminServiceProxyServer(
 	clientProvider := client.NewClientProvider(clientConfig, clientFactory, logger)
 	return &adminServiceProxyServer{
 		adminClient:  adminclient.NewLazyClient(clientProvider),
+		shardManager: shardManager,
 		logger:       logger,
 		proxyOptions: opts,
 	}
@@ -106,10 +111,17 @@ func (s *adminServiceProxyServer) DescribeCluster(ctx context.Context, in0 *admi
 		}
 	}
 
-	if cfg := s.Config.ShardCountConfig; cfg.Mode == config.ShardCountLCM && resp != nil {
-		// Present a fake number of shards. In LCM mode, we present the least
-		// common multiple of both cluster shard counts.
-		resp.HistoryShardCount = common.LCM(cfg.RemoteShardCount, cfg.LocalShardCount)
+	if cfg := s.Config.ShardCountConfig; resp != nil {
+		switch cfg.Mode {
+		case config.ShardCountLCM:
+			// Present a fake number of shards. In LCM mode, we present the least
+			// common multiple of both cluster shard counts.
+			resp.HistoryShardCount = common.LCM(cfg.RemoteShardCount, cfg.LocalShardCount)
+		case config.ShardCountFixed:
+			if !s.IsInbound {
+				resp.HistoryShardCount = cfg.LocalShardCount
+			}
+		}
 	}
 
 	return resp, err
@@ -239,6 +251,139 @@ func ClusterShardIDtoString(sd history.ClusterShardID) string {
 	return fmt.Sprintf("(id: %d, shard: %d)", sd.ClusterID, sd.ShardID)
 }
 
+// forwardToProxy forwards a stream to another proxy instance
+func (s *adminServiceProxyServer) forwardToProxy(
+	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
+	ownerNode string,
+	clientShardID history.ClusterShardID,
+) error {
+	// Get the proxy address for the owner node
+	proxyAddr, found := s.shardManager.GetProxyAddress(ownerNode)
+	if !found {
+		s.logger.Error("No proxy address found for owner node",
+			tag.NewStringTag("owner", ownerNode),
+			tag.NewStringTag("clientShard", ClusterShardIDtoString(clientShardID)))
+		if s.Config.MemberlistConfig != nil {
+			metrics.ShardForwardingCounter.WithLabelValues(s.Config.MemberlistConfig.NodeName, ownerNode, "no_address").Inc()
+		}
+		return serviceerror.NewInternal(fmt.Sprintf("no proxy address found for node: %s", ownerNode))
+	}
+
+	s.logger.Info("Forwarding stream to proxy",
+		tag.NewStringTag("clientShard", ClusterShardIDtoString(clientShardID)),
+		tag.NewStringTag("owner", ownerNode),
+		tag.NewStringTag("address", proxyAddr))
+
+	// Create connection to the target proxy
+	conn, err := grpc.NewClient(proxyAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		s.logger.Error("Failed to connect to target proxy",
+			tag.Error(err),
+			tag.NewStringTag("address", proxyAddr))
+		if s.Config.MemberlistConfig != nil {
+			metrics.ShardForwardingCounter.WithLabelValues(s.Config.MemberlistConfig.NodeName, ownerNode, "connection_failed").Inc()
+		}
+		return serviceerror.NewInternal(fmt.Sprintf("failed to connect to proxy: %v", err))
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			s.logger.Error("Failed to close connection", tag.Error(err))
+		}
+	}()
+
+	// Create admin service client for the target proxy
+	targetProxyClient := adminservice.NewAdminServiceClient(conn)
+
+	// Forward the stream context and metadata
+	ctx := targetStreamServer.Context()
+	outgoingContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Start the forwarded stream
+	forwardedStream, err := targetProxyClient.StreamWorkflowReplicationMessages(outgoingContext)
+	if err != nil {
+		s.logger.Error("Failed to start forwarded stream",
+			tag.Error(err),
+			tag.NewStringTag("address", proxyAddr))
+		if s.Config.MemberlistConfig != nil {
+			metrics.ShardForwardingCounter.WithLabelValues(s.Config.MemberlistConfig.NodeName, ownerNode, "stream_failed").Inc()
+		}
+		return serviceerror.NewInternal(fmt.Sprintf("failed to start forwarded stream: %v", err))
+	}
+
+	if s.Config.MemberlistConfig != nil {
+		metrics.ShardForwardingCounter.WithLabelValues(s.Config.MemberlistConfig.NodeName, ownerNode, "success").Inc()
+	}
+
+	// Set up bidirectional forwarding
+	shutdownChan := channel.NewShutdownOnce()
+
+	// Forward from target server to forwarded stream
+	go func() {
+		defer func() {
+			s.logger.Debug("Shutdown target->forwarded forwarding loop")
+			shutdownChan.Shutdown()
+			if err := forwardedStream.CloseSend(); err != nil {
+				s.logger.Error("Failed to close forwarded stream", tag.Error(err))
+			}
+		}()
+
+		for !shutdownChan.IsShutdown() {
+			req, err := targetStreamServer.Recv()
+			if err == io.EOF {
+				s.logger.Debug("Target stream recv EOF")
+				return
+			}
+			if err != nil {
+				s.logger.Error("Target stream recv error", tag.Error(err))
+				return
+			}
+
+			if err := forwardedStream.Send(req); err != nil {
+				if err != io.EOF {
+					s.logger.Error("Forwarded stream send error", tag.Error(err))
+				}
+				return
+			}
+		}
+	}()
+
+	// Forward from forwarded stream to target server
+	go func() {
+		defer func() {
+			s.logger.Debug("Shutdown forwarded->target forwarding loop")
+			shutdownChan.Shutdown()
+		}()
+
+		for !shutdownChan.IsShutdown() {
+			resp, err := forwardedStream.Recv()
+			if err == io.EOF {
+				s.logger.Debug("Forwarded stream recv EOF")
+				return
+			}
+			if err != nil {
+				s.logger.Error("Forwarded stream recv error", tag.Error(err))
+				return
+			}
+
+			if err := targetStreamServer.Send(resp); err != nil {
+				if err != io.EOF {
+					s.logger.Error("Target stream send error", tag.Error(err))
+				}
+				return
+			}
+		}
+	}()
+
+	// Wait for shutdown
+	select {
+	case <-shutdownChan.Channel():
+		return nil
+	case <-outgoingContext.Done():
+		return outgoingContext.Err()
+	}
+}
+
 func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 ) (retError error) {
@@ -253,6 +398,12 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	)
 	if err != nil {
 		return err
+	}
+
+	// Register this shard as handled by this proxy
+	if !s.IsInbound {
+		s.shardManager.RegisterShard(clientShardID)
+		defer s.shardManager.UnregisterShard(clientShardID)
 	}
 
 	logger := log.With(s.logger,
@@ -299,10 +450,11 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 		// cluster, remapping proxy stream shard ids to the target cluster shard ids.
 		newClientShardID := history.ClusterShardID{
 			ClusterID: clientShardID.ClusterID,
-			ShardID:   serverShardID.ShardID, // proxy fake shard id
+			ShardID:   clientShardID.ShardID, // proxy fake shard id
 		}
 		newServerShardID := history.ClusterShardID{
 			ClusterID: serverShardID.ClusterID,
+			ShardID:   serverShardID.ShardID,
 		}
 		LCM := common.LCM(cfg.LocalShardCount, cfg.RemoteShardCount)
 		if s.IsInbound {
@@ -310,7 +462,7 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 			newServerShardID.ShardID = mapShardIDUnique(LCM, cfg.LocalShardCount, serverShardID.ShardID)
 		} else {
 			// Stream is going to remote server.
-			newServerShardID.ShardID = serverShardID.ShardID
+			newClientShardID.ShardID = serverShardID.ShardID
 		}
 
 		logger = log.With(logger,
@@ -322,6 +474,21 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 		targetMetadata.Set(history.MetadataKeyClientShardID, strconv.Itoa(int(newClientShardID.ShardID)))
 		targetMetadata.Set(history.MetadataKeyServerClusterID, strconv.Itoa(int(newServerShardID.ClusterID)))
 		targetMetadata.Set(history.MetadataKeyServerShardID, strconv.Itoa(int(newServerShardID.ShardID)))
+
+		serverShardID = newServerShardID
+	}
+
+	// Check if we need to forward to another proxy for the target shard (only for inbound connections with forwarding enabled)
+	if s.IsInbound && s.Config.MemberlistConfig != nil && s.Config.MemberlistConfig.EnableForwarding && !s.shardManager.IsLocalShard(serverShardID) {
+		ownerNode, found := s.shardManager.GetShardOwner(serverShardID)
+		if found {
+			s.logger.Info("Forwarding inbound stream to target shard owner",
+				tag.NewStringTag("serverShard", ClusterShardIDtoString(serverShardID)),
+				tag.NewStringTag("owner", ownerNode))
+			return s.forwardToProxy(targetStreamServer, ownerNode, serverShardID)
+		}
+		s.logger.Warn("No owner found for target shard, handling locally",
+			tag.NewStringTag("serverShard", ClusterShardIDtoString(serverShardID)))
 	}
 
 	outgoingContext := metadata.NewOutgoingContext(targetStreamServer.Context(), targetMetadata)
