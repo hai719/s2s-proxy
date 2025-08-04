@@ -260,6 +260,10 @@ func ClusterShardIDtoShortString(sd history.ClusterShardID) string {
 	return fmt.Sprintf("%d:%d", sd.ClusterID, sd.ShardID)
 }
 
+// StreamWorkflowReplicationMessages establishes an HTTP/2 stream. gRPC passes us a stream that represents the initiating server,
+// and we can freely Send and Recv on that "server". Because this is a proxy, we also establish a bidirectional
+// stream using our configured adminClient. When we Recv on the initiator, we Send to the client.
+// When we Recv on the client, we Send to the initiator
 func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	streamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 ) (retError error) {
@@ -298,6 +302,7 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 
 	streamsActiveGauge := metrics.AdminServiceStreamsActive.WithLabelValues(directionLabel)
 	streamsActiveGauge.Inc()
+	metrics.AdminServiceStreamsOpenedCount.WithLabelValues(directionLabel).Inc()
 	defer streamsActiveGauge.Dec()
 
 	if cfg := s.Config.ShardCountConfig; cfg.Mode == config.ShardCountLCM {
@@ -493,7 +498,6 @@ func (s *adminServiceProxyServer) streamRouting(
 		proxyStreamReceiverReverse.Run(shutdownChan)
 	}()
 	wg.Wait()
-
 	return nil
 }
 
