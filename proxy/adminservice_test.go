@@ -49,7 +49,9 @@ func (s *adminserviceSuite) newAdminServiceProxyServer(opts proxyOptions) admins
 	s.clientFactoryMock.EXPECT().NewRemoteAdminClient(cfg).Return(s.adminClientMock, nil).Times(1)
 	// Use noop shard manager for tests
 	shardManager := &noopShardManager{}
-	return NewAdminServiceProxyServer("test-service-name", cfg, s.clientFactoryMock, shardManager, opts, log.NewTestLogger())
+	// Create a minimal proxy server for testing
+	ps := &ProxyServer{}
+	return NewAdminServiceProxyServer(ps, "test-service-name", cfg, s.clientFactoryMock, shardManager, opts, s.adminClientMock, log.NewTestLogger())
 }
 
 func (s *adminserviceSuite) TestAddOrUpdateRemoteCluster() {

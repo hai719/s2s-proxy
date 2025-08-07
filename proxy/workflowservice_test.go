@@ -78,7 +78,9 @@ func TestNamespaceFiltering(t *testing.T) {
 		},
 	}
 	mockClientFactory.EXPECT().NewRemoteWorkflowServiceClient(clientConfig).Return(mockServiceClient, nil).Times(1)
-	wfProxy := NewWorkflowServiceProxyServer("My cool test server", clientConfig, mockClientFactory,
+	// Create a minimal proxy server for testing
+	ps := &ProxyServer{}
+	wfProxy := NewWorkflowServiceProxyServer(ps, "My cool test server", clientConfig, mockClientFactory,
 		auth.NewAccesControl([]string{"Bob Ross's Paint Shop"}), log.NewTestLogger())
 
 	res, _ := wfProxy.ListNamespaces(metadata.NewIncomingContext(context.Background(), metadata.New(map[string]string{})),

@@ -38,6 +38,7 @@ type DebugResponse struct {
 	ActiveStreams []proxy.StreamInfo         `json:"active_streams"`
 	StreamCount   int                        `json:"stream_count"`
 	ShardInfo     proxy.ShardDebugInfo       `json:"shard_info"`
+	ChannelInfo   proxy.ChannelDebugInfo     `json:"channel_info"`
 }
 
 func run(args []string) error {
@@ -100,11 +101,13 @@ func handleDebugConnections(w http.ResponseWriter, r *http.Request, proxyInstanc
 	var activeStreams []proxy.StreamInfo
 	var streamCount int
 	var shardInfo proxy.ShardDebugInfo
+	var channelInfo proxy.ChannelDebugInfo
 
 	// Get connection information from the proxy
 	if proxyInstance != nil {
 		connections = proxyInstance.GetConnectionInfo()
 		shardInfo = proxyInstance.GetShardInfo()
+		channelInfo = proxyInstance.GetChannelInfo()
 	}
 
 	// Get active streams information
@@ -118,6 +121,7 @@ func handleDebugConnections(w http.ResponseWriter, r *http.Request, proxyInstanc
 		ActiveStreams: activeStreams,
 		StreamCount:   streamCount,
 		ShardInfo:     shardInfo,
+		ChannelInfo:   channelInfo,
 	}
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {

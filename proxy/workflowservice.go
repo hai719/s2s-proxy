@@ -17,6 +17,7 @@ type (
 	workflowServiceProxyServer struct {
 		workflowservice.UnimplementedWorkflowServiceServer
 		workflowServiceClient workflowservice.WorkflowServiceClient
+		ps                    *ProxyServer
 		namespaceAccess       *auth.AccessControl
 		logger                log.Logger
 	}
@@ -26,6 +27,7 @@ type (
 // be forwarded to the passed in WorkflowService Client. gRPC interceptors can be added on the Server or Client to adjust
 // requests and responses.
 func NewWorkflowServiceProxyServer(
+	ps *ProxyServer,
 	serviceName string,
 	clientConfig config.ProxyClientConfig,
 	clientFactory client.ClientFactory,
@@ -35,6 +37,7 @@ func NewWorkflowServiceProxyServer(
 	logger = log.With(logger, common.ServiceTag(serviceName))
 	clientProvider := client.NewClientProvider(clientConfig, clientFactory, logger)
 	return &workflowServiceProxyServer{
+		ps:                    ps,
 		workflowServiceClient: feclient.NewLazyClient(clientProvider),
 		namespaceAccess:       namespaceAccess,
 		logger:                logger,

@@ -1,19 +1,25 @@
 package proxy
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
 
 // StreamInfo represents information about an active gRPC stream
 type StreamInfo struct {
-	ID          string    `json:"id"`
-	Method      string    `json:"method"`
-	Direction   string    `json:"direction"`
-	ClientShard string    `json:"client_shard"`
-	ServerShard string    `json:"server_shard"`
-	StartTime   time.Time `json:"start_time"`
-	LastSeen    time.Time `json:"last_seen"`
+	ID                         string     `json:"id"`
+	Method                     string     `json:"method"`
+	Direction                  string     `json:"direction"`
+	ClientShard                string     `json:"client_shard"`
+	ServerShard                string     `json:"server_shard"`
+	StartTime                  time.Time  `json:"start_time"`
+	LastSeen                   time.Time  `json:"last_seen"`
+	TotalDuration              string     `json:"total_duration"`
+	IdleDuration               string     `json:"idle_duration"`
+	LastSyncWatermark          *int64     `json:"last_sync_watermark,omitempty"`
+	LastSyncWatermarkTime      *time.Time `json:"last_sync_watermark_time,omitempty"`
+	LastExclusiveHighWatermark *int64     `json:"last_exclusive_high_watermark,omitempty"`
 }
 
 // StreamTracker tracks active gRPC streams for debugging
@@ -56,6 +62,29 @@ func (st *StreamTracker) UpdateStream(id string) {
 	}
 }
 
+// UpdateStreamSyncReplicationState updates the sync replication state information for a stream
+func (st *StreamTracker) UpdateStreamSyncReplicationState(id string, inclusiveLowWatermark int64, watermarkTime *time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if stream, exists := st.streams[id]; exists {
+		stream.LastSeen = time.Now()
+		stream.LastSyncWatermark = &inclusiveLowWatermark
+		stream.LastSyncWatermarkTime = watermarkTime
+	}
+}
+
+// UpdateStreamReplicationMessages updates the replication messages information for a stream
+func (st *StreamTracker) UpdateStreamReplicationMessages(id string, exclusiveHighWatermark int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if stream, exists := st.streams[id]; exists {
+		stream.LastSeen = time.Now()
+		stream.LastExclusiveHighWatermark = &exclusiveHighWatermark
+	}
+}
+
 // UnregisterStream removes a stream from tracking
 func (st *StreamTracker) UnregisterStream(id string) {
 	st.mu.Lock()
@@ -69,9 +98,16 @@ func (st *StreamTracker) GetActiveStreams() []StreamInfo {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 
+	now := time.Now()
 	streams := make([]StreamInfo, 0, len(st.streams))
 	for _, stream := range st.streams {
-		streams = append(streams, *stream)
+		// Create a copy and calculate both durations in seconds
+		streamCopy := *stream
+		totalSeconds := int(now.Sub(stream.StartTime).Seconds())
+		idleSeconds := int(now.Sub(stream.LastSeen).Seconds())
+		streamCopy.TotalDuration = formatDurationSeconds(totalSeconds)
+		streamCopy.IdleDuration = formatDurationSeconds(idleSeconds)
+		streams = append(streams, streamCopy)
 	}
 
 	return streams
@@ -91,4 +127,34 @@ var globalStreamTracker = NewStreamTracker()
 // GetGlobalStreamTracker returns the global stream tracker instance
 func GetGlobalStreamTracker() *StreamTracker {
 	return globalStreamTracker
+}
+
+// formatDurationSeconds formats a duration in seconds to a readable string
+func formatDurationSeconds(totalSeconds int) string {
+	if totalSeconds < 60 {
+		return fmt.Sprintf("%ds", totalSeconds)
+	}
+
+	minutes := totalSeconds / 60
+	seconds := totalSeconds % 60
+
+	if minutes < 60 {
+		if seconds == 0 {
+			return fmt.Sprintf("%dm", minutes)
+		}
+		return fmt.Sprintf("%dm%ds", minutes, seconds)
+	}
+
+	hours := minutes / 60
+	minutes = minutes % 60
+
+	if minutes == 0 && seconds == 0 {
+		return fmt.Sprintf("%dh", hours)
+	} else if seconds == 0 {
+		return fmt.Sprintf("%dh%dm", hours, minutes)
+	} else if minutes == 0 {
+		return fmt.Sprintf("%dh%ds", hours, seconds)
+	} else {
+		return fmt.Sprintf("%dh%dm%ds", hours, minutes, seconds)
+	}
 }

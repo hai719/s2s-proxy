@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 
 	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.temporal.io/server/api/adminservice/v1"
+	"go.temporal.io/server/client/history"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"google.golang.org/grpc"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/temporalio/s2s-proxy/auth"
 	"github.com/temporalio/s2s-proxy/client"
+	adminclient "github.com/temporalio/s2s-proxy/client/admin"
 	"github.com/temporalio/s2s-proxy/config"
 	"github.com/temporalio/s2s-proxy/encryption"
 	"github.com/temporalio/s2s-proxy/interceptor"
@@ -23,11 +27,21 @@ import (
 )
 
 type (
+	// ChannelDebugInfo holds debug information about channels
+	ChannelDebugInfo struct {
+		RemoteSendChannels map[string]int `json:"remote_send_channels"` // shard ID -> buffer size
+		LocalAckChannels   map[string]int `json:"local_ack_channels"`   // shard ID -> buffer size
+		TotalSendChannels  int            `json:"total_send_channels"`
+		TotalAckChannels   int            `json:"total_ack_channels"`
+	}
+
 	ProxyServer struct {
+		proxy        *Proxy
 		config       config.ProxyConfig
 		opts         proxyOptions
 		logger       log.Logger
 		server       *TemporalAPIServer
+		adminClient  adminservice.AdminServiceClient
 		transManager *transport.TransportManager
 		shardManager ShardManager
 		shutDownCh   chan struct{}
@@ -42,6 +56,18 @@ type (
 		metricsServer     *http.Server
 		shardManager      ShardManager
 		logger            log.Logger
+
+		// remoteSendChannels maps shard IDs to send channels for replication message routing
+		remoteSendChannels   map[history.ClusterShardID]chan *adminservice.StreamWorkflowReplicationMessagesResponse
+		remoteSendChannelsMu sync.RWMutex
+
+		// localAckChannels maps shard IDs to ack channels for local acknowledgment handling
+		localAckChannels   map[history.ClusterShardID]chan *adminservice.StreamWorkflowReplicationMessagesRequest
+		localAckChannelsMu sync.RWMutex
+
+		// localReceiverCancelFuncs maps shard IDs to context cancel functions for local receiver termination
+		localReceiverCancelFuncs   map[history.ClusterShardID]context.CancelFunc
+		localReceiverCancelFuncsMu sync.RWMutex
 	}
 
 	proxyOptions struct {
@@ -136,11 +162,13 @@ func (ps *ProxyServer) startServer(
 	}
 
 	clientFactory := client.NewClientFactory(clientTransport, logger)
+	clientProvider := client.NewClientProvider(cfg.Client, clientFactory, logger)
+	ps.adminClient = adminclient.NewLazyClient(clientProvider)
 	ps.server = NewTemporalAPIServer(
 		cfg.Name,
 		cfg.Server,
-		NewAdminServiceProxyServer(cfg.Name, cfg.Client, clientFactory, ps.shardManager, opts, logger),
-		NewWorkflowServiceProxyServer(cfg.Name, cfg.Client, clientFactory, ps.makeNamespaceACL(), logger),
+		NewAdminServiceProxyServer(ps, cfg.Name, cfg.Client, clientFactory, ps.shardManager, opts, ps.adminClient, logger),
+		NewWorkflowServiceProxyServer(ps, cfg.Name, cfg.Client, clientFactory, ps.makeNamespaceACL(), logger),
 		serverOpts,
 		serverTransport,
 		logger,
@@ -155,6 +183,10 @@ func (ps *ProxyServer) stopServer() {
 	if ps.server != nil {
 		ps.server.Stop()
 	}
+}
+
+func (ps *ProxyServer) GetAdminClient() adminservice.AdminServiceClient {
+	return ps.adminClient
 }
 
 func monitorClosable(closable transport.Closable, retryCh chan struct{}, shutDownCh <-chan struct{}) {
@@ -224,6 +256,7 @@ func (ps *ProxyServer) stop() {
 }
 
 func newProxyServer(
+	proxy *Proxy,
 	cfg config.ProxyConfig,
 	opts proxyOptions,
 	transManager *transport.TransportManager,
@@ -231,6 +264,7 @@ func newProxyServer(
 	logger log.Logger,
 ) *ProxyServer {
 	return &ProxyServer{
+		proxy:        proxy,
 		config:       cfg,
 		opts:         opts,
 		transManager: transManager,
@@ -248,10 +282,13 @@ func NewProxy(
 ) *Proxy {
 	s2sConfig := configProvider.GetS2SProxyConfig()
 	proxy := &Proxy{
-		config:       s2sConfig,
-		transManager: transManager,
-		shardManager: shardManager,
-		logger:       logger,
+		config:                   s2sConfig,
+		transManager:             transManager,
+		shardManager:             shardManager,
+		logger:                   logger,
+		remoteSendChannels:       make(map[history.ClusterShardID]chan *adminservice.StreamWorkflowReplicationMessagesResponse),
+		localAckChannels:         make(map[history.ClusterShardID]chan *adminservice.StreamWorkflowReplicationMessagesRequest),
+		localReceiverCancelFuncs: make(map[history.ClusterShardID]context.CancelFunc),
 	}
 
 	// Proxy consists of two grpc servers: inbound and outbound. The flow looks like the following:
@@ -262,6 +299,7 @@ func NewProxy(
 	//    server-a <-> proxy-a <-> proxy-b <-> server-b
 	if s2sConfig.Outbound != nil {
 		proxy.outboundServer = newProxyServer(
+			proxy,
 			*s2sConfig.Outbound,
 			proxyOptions{
 				IsInbound: false,
@@ -275,6 +313,7 @@ func NewProxy(
 
 	if s2sConfig.Inbound != nil {
 		proxy.inboundServer = newProxyServer(
+			proxy,
 			*s2sConfig.Inbound,
 			proxyOptions{
 				IsInbound: true,
@@ -408,4 +447,140 @@ func (s *Proxy) GetConnectionInfo() []transport.ConnectionInfo {
 // GetShardInfo returns debug information about shard distribution
 func (s *Proxy) GetShardInfo() ShardDebugInfo {
 	return s.shardManager.GetShardInfo()
+}
+
+// GetChannelInfo returns debug information about active channels
+func (s *Proxy) GetChannelInfo() ChannelDebugInfo {
+	remoteSendChannels := make(map[string]int)
+	var totalSendChannels int
+
+	// Collect remote send channel info first
+	s.remoteSendChannelsMu.RLock()
+	for shardID, ch := range s.remoteSendChannels {
+		shardKey := ClusterShardIDtoString(shardID)
+		remoteSendChannels[shardKey] = len(ch)
+	}
+	totalSendChannels = len(s.remoteSendChannels)
+	s.remoteSendChannelsMu.RUnlock()
+
+	localAckChannels := make(map[string]int)
+	var totalAckChannels int
+
+	// Collect local ack channel info separately
+	s.localAckChannelsMu.RLock()
+	for shardID, ch := range s.localAckChannels {
+		shardKey := ClusterShardIDtoString(shardID)
+		localAckChannels[shardKey] = len(ch)
+	}
+	totalAckChannels = len(s.localAckChannels)
+	s.localAckChannelsMu.RUnlock()
+
+	return ChannelDebugInfo{
+		RemoteSendChannels: remoteSendChannels,
+		LocalAckChannels:   localAckChannels,
+		TotalSendChannels:  totalSendChannels,
+		TotalAckChannels:   totalAckChannels,
+	}
+}
+
+// SetRemoteSendChan registers a send channel for a specific shard ID
+func (s *Proxy) SetRemoteSendChan(shardID history.ClusterShardID, sendChan chan *adminservice.StreamWorkflowReplicationMessagesResponse) {
+	s.remoteSendChannelsMu.Lock()
+	defer s.remoteSendChannelsMu.Unlock()
+	s.remoteSendChannels[shardID] = sendChan
+	s.logger.Info("Registered remote send channel for shard", tag.NewStringTag("shardID", ClusterShardIDtoString(shardID)))
+}
+
+// GetRemoteSendChan retrieves the send channel for a specific shard ID
+func (s *Proxy) GetRemoteSendChan(shardID history.ClusterShardID) (chan *adminservice.StreamWorkflowReplicationMessagesResponse, bool) {
+	s.remoteSendChannelsMu.RLock()
+	defer s.remoteSendChannelsMu.RUnlock()
+	ch, exists := s.remoteSendChannels[shardID]
+	return ch, exists
+}
+
+// GetAllRemoteSendChans returns a map of all remote send channels
+func (s *Proxy) GetAllRemoteSendChans() map[history.ClusterShardID]chan *adminservice.StreamWorkflowReplicationMessagesResponse {
+	s.remoteSendChannelsMu.RLock()
+	defer s.remoteSendChannelsMu.RUnlock()
+
+	// Create a copy of the map
+	result := make(map[history.ClusterShardID]chan *adminservice.StreamWorkflowReplicationMessagesResponse, len(s.remoteSendChannels))
+	for k, v := range s.remoteSendChannels {
+		result[k] = v
+	}
+	return result
+}
+
+// RemoveRemoteSendChan removes the send channel for a specific shard ID
+func (s *Proxy) RemoveRemoteSendChan(shardID history.ClusterShardID) {
+	s.remoteSendChannelsMu.Lock()
+	defer s.remoteSendChannelsMu.Unlock()
+	delete(s.remoteSendChannels, shardID)
+	s.logger.Info("Removed remote send channel for shard", tag.NewStringTag("shardID", ClusterShardIDtoString(shardID)))
+}
+
+// SetLocalAckChan registers an ack channel for a specific shard ID
+func (s *Proxy) SetLocalAckChan(shardID history.ClusterShardID, ackChan chan *adminservice.StreamWorkflowReplicationMessagesRequest) {
+	s.localAckChannelsMu.Lock()
+	defer s.localAckChannelsMu.Unlock()
+	s.localAckChannels[shardID] = ackChan
+	s.logger.Info("Registered local ack channel for shard", tag.NewStringTag("shardID", ClusterShardIDtoString(shardID)))
+}
+
+// GetLocalAckChan retrieves the ack channel for a specific shard ID
+func (s *Proxy) GetLocalAckChan(shardID history.ClusterShardID) (chan *adminservice.StreamWorkflowReplicationMessagesRequest, bool) {
+	s.localAckChannelsMu.RLock()
+	defer s.localAckChannelsMu.RUnlock()
+	ch, exists := s.localAckChannels[shardID]
+	return ch, exists
+}
+
+// RemoveLocalAckChan removes the ack channel for a specific shard ID
+func (s *Proxy) RemoveLocalAckChan(shardID history.ClusterShardID) {
+	s.localAckChannelsMu.Lock()
+	defer s.localAckChannelsMu.Unlock()
+	delete(s.localAckChannels, shardID)
+	s.logger.Info("Removed local ack channel for shard", tag.NewStringTag("shardID", ClusterShardIDtoString(shardID)))
+}
+
+// SetLocalReceiverCancelFunc registers a cancel function for a local receiver for a specific shard ID
+func (s *Proxy) SetLocalReceiverCancelFunc(shardID history.ClusterShardID, cancelFunc context.CancelFunc) {
+	s.localReceiverCancelFuncsMu.Lock()
+	defer s.localReceiverCancelFuncsMu.Unlock()
+	s.localReceiverCancelFuncs[shardID] = cancelFunc
+	s.logger.Info("Registered local receiver cancel function for shard", tag.NewStringTag("shardID", ClusterShardIDtoString(shardID)))
+}
+
+// GetLocalReceiverCancelFunc retrieves the cancel function for a local receiver for a specific shard ID
+func (s *Proxy) GetLocalReceiverCancelFunc(shardID history.ClusterShardID) (context.CancelFunc, bool) {
+	s.localReceiverCancelFuncsMu.RLock()
+	defer s.localReceiverCancelFuncsMu.RUnlock()
+	cancelFunc, exists := s.localReceiverCancelFuncs[shardID]
+	return cancelFunc, exists
+}
+
+// RemoveLocalReceiverCancelFunc removes the cancel function for a local receiver for a specific shard ID
+func (s *Proxy) RemoveLocalReceiverCancelFunc(shardID history.ClusterShardID) {
+	s.localReceiverCancelFuncsMu.Lock()
+	defer s.localReceiverCancelFuncsMu.Unlock()
+	delete(s.localReceiverCancelFuncs, shardID)
+	s.logger.Info("Removed local receiver cancel function for shard", tag.NewStringTag("shardID", ClusterShardIDtoString(shardID)))
+}
+
+// TerminatePreviousLocalReceiver checks if there is a previous local receiver for this shard and terminates it if needed
+func (s *Proxy) TerminatePreviousLocalReceiver(clientShardID history.ClusterShardID) {
+	// Check if there's a previous cancel function for this shard
+	if prevCancelFunc, exists := s.GetLocalReceiverCancelFunc(clientShardID); exists {
+		s.logger.Info("Terminating previous local receiver for shard", tag.NewStringTag("shardID", ClusterShardIDtoString(clientShardID)))
+
+		// Cancel the previous receiver's context
+		prevCancelFunc()
+
+		// Remove the cancel function from tracking
+		s.RemoveLocalReceiverCancelFunc(clientShardID)
+
+		// Also clean up the associated ack channel if it exists
+		s.RemoveLocalAckChan(clientShardID)
+	}
 }
