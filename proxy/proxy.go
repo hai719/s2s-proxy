@@ -315,10 +315,15 @@ func NewProxy(
 ) *Proxy {
 	s2sConfig := configProvider.GetS2SProxyConfig()
 	proxy := &Proxy{
-		config:                   s2sConfig,
-		transManager:             transManager,
-		shardManager:             shardManager,
-		logger:                   logger,
+		config:       s2sConfig,
+		transManager: transManager,
+		shardManager: shardManager,
+		logger: log.NewThrottledLogger(
+			logger,
+			func() float64 {
+				return s2sConfig.Logging.GetThrottleMaxRPS()
+			},
+		),
 		remoteSendChannels:       make(map[history.ClusterShardID]chan RoutedMessage),
 		localAckChannels:         make(map[history.ClusterShardID]chan RoutedAck),
 		localReceiverCancelFuncs: make(map[history.ClusterShardID]context.CancelFunc),
@@ -359,6 +364,7 @@ func NewProxy(
 			proxy.intraMgr.Notify()
 			// proxy.intraMgr.ReconcilePeerStreams(proxy, peer)
 		})
+
 	}
 
 	// Proxy consists of two grpc servers: inbound and outbound. The flow looks like the following:
@@ -377,7 +383,7 @@ func NewProxy(
 			},
 			transManager,
 			shardManager,
-			logger,
+			proxy.logger,
 		)
 	}
 
@@ -391,7 +397,7 @@ func NewProxy(
 			},
 			transManager,
 			shardManager,
-			logger,
+			proxy.logger,
 		)
 	}
 

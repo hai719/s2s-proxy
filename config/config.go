@@ -16,7 +16,8 @@ const (
 	ConfigPathFlag = "config"
 	LogLevelFlag   = "level"
 
-	DefaultPProfAddress = "localhost:6060"
+	DefaultPProfAddress          = "localhost:6060"
+	DefaultLoggingThrottleMaxRPS = 10.0
 )
 
 type TransportType string
@@ -126,6 +127,7 @@ type (
 		MemberlistConfig           *MemberlistConfig     `yaml:"memberlist"`
 		Metrics                    *MetricsConfig        `yaml:"metrics"`
 		ProfilingConfig            ProfilingConfig       `yaml:"profiling"`
+		Logging                    LoggingConfig         `yaml:"logging"`
 	}
 
 	SATranslationConfig struct {
@@ -208,6 +210,10 @@ type (
 		ProbeTimeoutMs int `yaml:"probeTimeoutMs"`
 		// Probe interval for memberlist health checks
 		ProbeIntervalMs int `yaml:"probeIntervalMs"`
+	}
+
+	LoggingConfig struct {
+		ThrottleMaxRPS float64 `yaml:"throttleMaxRPS"`
 	}
 )
 
@@ -410,4 +416,11 @@ func (s SATranslationConfig) ToMaps(inBound bool) (map[string]map[string]string,
 		}
 	}
 	return reqMap, respMap
+}
+
+func (l LoggingConfig) GetThrottleMaxRPS() float64 {
+	if l.ThrottleMaxRPS > 0 {
+		return l.ThrottleMaxRPS
+	}
+	return DefaultLoggingThrottleMaxRPS
 }
