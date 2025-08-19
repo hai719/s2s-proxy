@@ -3,6 +3,7 @@ package transport
 import (
 	"crypto/tls"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -230,6 +231,10 @@ func (m *muxConnectMananger) clientLoop(setting config.TCPClientSetting) error {
 				m.muxTransport = newMuxTransport(conn, session)
 				m.startTime = time.Now()
 				m.waitForReconnect()
+
+				// Don't retry more frequently than once per second.
+				// Sleep a random amount between 1s-2s.
+				time.Sleep(time.Second + time.Duration(rand.IntN(1000))*time.Millisecond)
 			}
 		}
 	}()
