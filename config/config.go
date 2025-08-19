@@ -121,6 +121,7 @@ type (
 		Outbound                   *ProxyConfig          `yaml:"outbound"`
 		MuxTransports              []MuxTransportConfig  `yaml:"mux"`
 		HealthCheck                *HealthCheckConfig    `yaml:"healthCheck"`
+		OutboundHealthCheck        *HealthCheckConfig    `yaml:"outboundHealthCheck"`
 		NamespaceNameTranslation   NameTranslationConfig `yaml:"namespaceNameTranslation"`
 		SearchAttributeTranslation SATranslationConfig   `yaml:"searchAttributeTranslation"`
 		ShardCountConfig           ShardCountConfig      `yaml:"shardCount"`
