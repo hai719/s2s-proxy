@@ -47,6 +47,9 @@ var (
 		muxSessionLabels...)
 	MuxObserverReportCount = DefaultCounterVec("mux_observer_report_count", "Number of observer executions",
 		muxSessionLabels...)
+	muxManagerLabels       = []string{"addr", "mode", "config_name"}
+	MuxErrors              = DefaultCounterVec("mux_errors", "Number of errors observed from mux", muxManagerLabels...)
+	MuxConnectionEstablish = DefaultCounterVec("mux_connection_establish", "Number of times mux has established", muxManagerLabels...)
 
 	// ShardDistributionGauge tracks how many shards each proxy instance is handling
 	ShardDistributionGauge = DefaultGaugeVec("shard_distribution", "Number of shards handled by each proxy instance", "proxy_node")
@@ -87,4 +90,6 @@ func init() {
 	prometheus.MustRegister(MuxSessionOpen)
 	prometheus.MustRegister(MuxStreamsActive)
 	prometheus.MustRegister(MuxObserverReportCount)
+	prometheus.MustRegister(MuxErrors)
+	prometheus.MustRegister(MuxConnectionEstablish)
 }
