@@ -53,6 +53,15 @@ var (
 	MuxErrors              = DefaultCounterVec("mux_errors", "Number of errors observed from mux", muxManagerLabels...)
 	MuxConnectionEstablish = DefaultCounterVec("mux_connection_establish", "Number of times mux has established", muxManagerLabels...)
 
+	translationLabels = []string{"kind", "message_type"}
+	TranslationCount  = DefaultCounterVec("translation_success", "Count of message translations", translationLabels...)
+	TranslationErrors = DefaultCounterVec("translation_error", "Count of message translation errors", translationLabels...)
+
+	UTF8RepairTranslationKind = "utf8repair"
+	NamespaceTranslationKind  = "namespace"
+	SearchAttrTranslationKind = "search-attribute"
+	HistoryBlobMessageType    = "HistoryEventBlob"
+
 	// ShardDistributionGauge tracks how many shards each proxy instance is handling
 	ShardDistributionGauge = DefaultGaugeVec("shard_distribution", "Number of shards handled by each proxy instance", "proxy_node")
 
@@ -96,4 +105,7 @@ func init() {
 	prometheus.MustRegister(MuxObserverReportCount)
 	prometheus.MustRegister(MuxErrors)
 	prometheus.MustRegister(MuxConnectionEstablish)
+
+	prometheus.MustRegister(TranslationCount)
+	prometheus.MustRegister(TranslationErrors)
 }
