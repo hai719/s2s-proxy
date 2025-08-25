@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/temporalio/s2s-proxy/common"
-
 	"github.com/temporalio/s2s-proxy/metrics"
 )
 
