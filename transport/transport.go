@@ -5,7 +5,6 @@ import (
 	"time"
 
 	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
-	prometheus "github.com/prometheus/client_golang/prometheus"
 	"go.temporal.io/server/common/log"
 	"google.golang.org/grpc"
 
@@ -92,7 +91,7 @@ func (tm *TransportManager) IsMuxActive(name string) bool {
 	return tm.muxConnManagers[name].status.Load() == int32(statusStarted)
 }
 
-func (tm *TransportManager) OpenClient(metricLabels prometheus.Labels, clientConfig config.ProxyClientConfig) (ClientTransport, error) {
+func (tm *TransportManager) OpenClient(clientConfig config.ProxyClientConfig) (ClientTransport, error) {
 	if clientConfig.Type == config.MuxTransport {
 		return tm.openMuxTransport(clientConfig.MuxTransportName)
 	}
