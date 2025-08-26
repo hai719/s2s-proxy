@@ -57,7 +57,7 @@ type (
 	}
 
 	TransportManager struct {
-		muxConnManagers map[string]*muxConnectMananger
+		muxConnManagers map[string]*muxConnectManager
 		logger          log.Logger
 	}
 )
@@ -67,7 +67,7 @@ func NewTransportManager(
 	logger log.Logger,
 ) *TransportManager {
 
-	muxConnManagers := make(map[string]*muxConnectMananger)
+	muxConnManagers := make(map[string]*muxConnectManager)
 	s2sConfig := configProvider.GetS2SProxyConfig()
 	for _, cfg := range s2sConfig.MuxTransports {
 		muxConnManagers[cfg.Name] = newMuxConnectManager(cfg, logger)
