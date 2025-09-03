@@ -3,16 +3,10 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"io"
-	"math"
-	"strconv"
-	"strings"
 	"sync"
-	"time"
 
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/api/adminservice/v1"
-	replicationv1 "go.temporal.io/server/api/replication/v1"
 	"go.temporal.io/server/client/history"
 	servercommon "go.temporal.io/server/common"
 	"go.temporal.io/server/common/channel"
@@ -122,8 +116,10 @@ func (s *adminServiceProxyServer) DescribeCluster(ctx context.Context, in0 *admi
 			// Present a fake number of shards. In LCM mode, we present the least
 			// common multiple of both cluster shard counts.
 			resp.HistoryShardCount = common.LCM(cfg.RemoteShardCount, cfg.LocalShardCount)
-		case config.ShardCountFixed:
-			if !s.IsInbound {
+		case config.ShardCountRouting:
+			if s.IsInbound {
+				resp.HistoryShardCount = cfg.RemoteShardCount
+			} else {
 				resp.HistoryShardCount = cfg.LocalShardCount
 			}
 		}
@@ -256,469 +252,6 @@ func ClusterShardIDtoString(sd history.ClusterShardID) string {
 	return fmt.Sprintf("(id: %d, shard: %d)", sd.ClusterID, sd.ShardID)
 }
 
-// streamRouting handles stream routing for fixed shard count mode with forwarding enabled.
-// This function manages both inbound and outbound stream connections to ensure proper
-// shard ownership and paired stream lifecycle management.
-func (s *adminServiceProxyServer) streamRouting(
-	logger log.Logger,
-	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
-	streamTracker *StreamTracker,
-	streamID string,
-	targetMetadata metadata.MD,
-	clientShardID history.ClusterShardID,
-	serverShardID history.ClusterShardID,
-) error {
-	logger.Info("streamRouting called for fixed shard count mode",
-		tag.NewStringTag("isInbound", fmt.Sprintf("%t", s.IsInbound)))
-
-	if s.IsInbound {
-		// Inbound flow: Remote → Proxy → Local
-		// When a remote cluster connects to this proxy, this proxy becomes the owner
-		// of the target shard
-		logger.Info("Handling inbound stream routing")
-		return s.handleInboundStream(targetStreamServer, streamTracker, streamID, clientShardID, serverShardID, logger)
-	} else {
-		// Outbound flow: Local → Proxy → Remote
-		// This is the paired stream for the inbound connection
-		logger.Info("Handling outbound stream routing")
-		return s.handleOutboundStream(targetStreamServer, streamTracker, streamID, targetMetadata, clientShardID, serverShardID, logger)
-	}
-}
-
-func (s *adminServiceProxyServer) handleInboundStream(
-	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
-	streamTracker *StreamTracker,
-	streamID string,
-	clientShardID history.ClusterShardID,
-	serverShardID history.ClusterShardID,
-	logger log.Logger,
-) error {
-	logger.Info("handleInboundStream: using streamWithLocalServer for inbound traffic")
-
-	shutdownChan := channel.NewShutdownOnce()
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-
-	// send loop: send replication tasks to remote proxy
-	sendChan := make(chan *adminservice.StreamWorkflowReplicationMessagesResponse, 100)
-	s.ps.proxy.SetRemoteSendChan(clientShardID, sendChan)
-	defer s.ps.proxy.RemoveRemoteSendChan(clientShardID) // Ensure cleanup on function exit
-
-	go func() {
-		defer func() {
-			logger.Info("Shutdown targetStreamServer.Send loop.")
-			shutdownChan.Shutdown()
-			wg.Done()
-		}()
-
-		for !shutdownChan.IsShutdown() {
-			select {
-			case resp := <-sendChan:
-				msg := make([]string, 0, len(resp.Attributes.(*adminservice.StreamWorkflowReplicationMessagesResponse_Messages).Messages.ReplicationTasks))
-				for i, task := range resp.Attributes.(*adminservice.StreamWorkflowReplicationMessagesResponse_Messages).Messages.ReplicationTasks {
-					msg = append(msg, fmt.Sprintf("[%d]: %v@%v", i, task.SourceTaskId, task.SourceShardId))
-				}
-				logger.Info("Sending replication tasks to remote proxy",
-					tag.NewStringTag("streamID", streamID),
-					tag.NewStringTag("priority", fmt.Sprintf("%v", resp.Attributes.(*adminservice.StreamWorkflowReplicationMessagesResponse_Messages).Messages.Priority)),
-					tag.NewStringTag("sourceShardId", fmt.Sprintf("%v", resp.Attributes.(*adminservice.StreamWorkflowReplicationMessagesResponse_Messages).Messages.SourceShardId)),
-					tag.NewStringTag("exclusiveHighWatermark", fmt.Sprintf("%v", resp.Attributes.(*adminservice.StreamWorkflowReplicationMessagesResponse_Messages).Messages.ExclusiveHighWatermark)),
-					tag.NewStringTag("tasks", strings.Join(msg, ", ")),
-				)
-				streamTracker.UpdateStream(streamID)
-				streamTracker.UpdateStreamReplicationMessages(streamID, resp.Attributes.(*adminservice.StreamWorkflowReplicationMessagesResponse_Messages).Messages.ExclusiveHighWatermark)
-				if err := targetStreamServer.Send(resp); err != nil {
-					logger.Error("targetStreamServer.Send encountered error", tag.Error(err))
-					return
-				}
-			case <-shutdownChan.Channel():
-				// Shutdown requested, exit the loop
-				return
-			}
-		}
-	}()
-
-	// recv loop: ACK from remote proxy, forward to ackChan managed by startLocalReceiver
-	go func() {
-		defer func() {
-			logger.Info("Shutdown targetStreamServer.Recv loop.")
-			shutdownChan.Shutdown()
-			wg.Done()
-		}()
-
-		for !shutdownChan.IsShutdown() {
-			req, err := targetStreamServer.Recv()
-			if err == io.EOF {
-				logger.Info("targetStreamServer.Recv encountered EOF", tag.Error(err))
-				return
-			}
-
-			if err != nil {
-				logger.Error("targetStreamServer.Recv encountered error", tag.Error(err))
-				return
-			}
-
-			// streamTracker.UpdateStream(streamID)
-
-			switch attr := req.GetAttributes().(type) {
-			case *adminservice.StreamWorkflowReplicationMessagesRequest_SyncReplicationState:
-				logger.Info(fmt.Sprintf("forwarding SyncReplicationState: inclusive %v, attr: %v", attr.SyncReplicationState.InclusiveLowWatermark, attr))
-
-				// Loop through each source shard state
-				for sourceShardID := range attr.SyncReplicationState.SourceShardStates {
-					logger.Info("Processing source shard state",
-						tag.NewInt32("sourceShardID", sourceShardID),
-						tag.NewStringTag("sourceShardState", fmt.Sprintf("%v", attr.SyncReplicationState.SourceShardStates[sourceShardID])),
-					)
-
-					// Get the appropriate ack channel for this shard
-					ackChan, ok := s.ps.proxy.GetLocalAckChan(history.ClusterShardID{
-						ClusterID: serverShardID.ClusterID,
-						ShardID:   sourceShardID,
-					})
-					if !ok {
-						logger.Error("No ack channel found for server shard", tag.NewStringTag("serverShard", ClusterShardIDtoString(serverShardID)))
-						continue
-					}
-					// TODO: send only the ACK for the source shard.
-					logger.Info("Sending ACK to source shard",
-						tag.NewStringTag("source_shard", fmt.Sprintf("%v", sourceShardID)),
-						tag.NewStringTag("ack", fmt.Sprintf("%v", req)),
-					)
-					ackChan <- req
-				}
-			default:
-				logger.Error("targetStreamServer.Recv encountered error", tag.Error(serviceerror.NewInternal(fmt.Sprintf(
-					"StreamWorkflowReplicationMessages encountered unknown type: %T %v", attr, attr,
-				))))
-				return
-			}
-		}
-	}()
-
-	wg.Wait()
-
-	return nil
-}
-
-func (s *adminServiceProxyServer) handleOutboundStream(
-	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
-	streamTracker *StreamTracker,
-	streamID string,
-	targetMetadata metadata.MD,
-	clientShardID history.ClusterShardID,
-	serverShardID history.ClusterShardID,
-	logger log.Logger,
-) error {
-	logger.Info("handleOutboundStream: using streamForwarding for outbound traffic")
-
-	// shutdownChan := channel.NewShutdownOnce()
-	// 1. Use streamForwarding() for direct forwarding to remote proxy
-	// This handles the bidirectional communication with the remote proxy
-	errChan := make(chan error, 1)
-	go func() {
-		err := s.streamForwarding(logger, targetStreamServer, streamTracker, streamID, targetMetadata, nil)
-		if err != nil {
-			logger.Error("streamForwarding encountered error", tag.Error(err))
-		}
-		errChan <- err
-	}()
-
-	// 2. establish a stream to local server as a receiver. When receiving replication tasks from local server, we need to recalculate the target shard, and forward to the correct stream managed by handleInboundStream.
-	go func() {
-		err := s.startLocalReceiver(clientShardID, serverShardID, nil)
-		if err != nil {
-			logger.Error("localReceiver encountered error", tag.Error(err))
-		}
-		errChan <- err
-	}()
-
-	// 3. The streams in 1 and 2 should be closed together.
-	return <-errChan
-}
-
-func (s *adminServiceProxyServer) startLocalReceiver(
-	clientShardID history.ClusterShardID,
-	serverShardID history.ClusterShardID,
-	shutdownChan channel.ShutdownOnce,
-) error {
-	logger := log.With(s.logger,
-		tag.NewStringTag("client", ClusterShardIDtoString(clientShardID)),
-		tag.NewStringTag("server", ClusterShardIDtoString(serverShardID)),
-	)
-
-	// Check if there is a previous local receiver for this shard, and terminate that if needed
-	s.ps.proxy.TerminatePreviousLocalReceiver(clientShardID)
-
-	// Create shutdownChan if it's nil
-	if shutdownChan == nil {
-		shutdownChan = channel.NewShutdownOnce()
-	}
-
-	md := metadata.New(map[string]string{})
-	md.Set(history.MetadataKeyClientClusterID, strconv.Itoa(int(serverShardID.ClusterID)))
-	md.Set(history.MetadataKeyClientShardID, strconv.Itoa(int(serverShardID.ShardID)))
-	md.Set(history.MetadataKeyServerClusterID, strconv.Itoa(int(clientShardID.ClusterID)))
-	md.Set(history.MetadataKeyServerShardID, strconv.Itoa(int(clientShardID.ShardID)))
-
-	outgoingContext := metadata.NewOutgoingContext(context.Background(), md)
-	outgoingContext, cancel := context.WithCancel(outgoingContext)
-	defer cancel() // Ensure context is cancelled to prevent leaks
-
-	// stream receiver -> local server's stream sender, clientShardID
-	sourceStreamClient, err := s.ps.proxy.inboundServer.GetAdminClient().StreamWorkflowReplicationMessages(outgoingContext)
-	if err != nil {
-		logger.Error("remoteAdminServiceClient.StreamWorkflowReplicationMessages encountered error", tag.Error(err))
-		return err
-	}
-
-	ackByTargetShard := make(map[history.ClusterShardID]*replicationv1.SourceShardStates)
-	ackChan := make(chan *adminservice.StreamWorkflowReplicationMessagesRequest, 100)
-	s.ps.proxy.SetLocalAckChan(clientShardID, ackChan)
-
-	// Register the cancel function for this local receiver so it can be terminated later if needed
-	s.ps.proxy.SetLocalReceiverCancelFunc(clientShardID, cancel)
-
-	defer func() {
-		// Ensure cleanup on function exit
-		s.ps.proxy.RemoveLocalAckChan(clientShardID)
-		s.ps.proxy.RemoveLocalReceiverCancelFunc(clientShardID)
-	}()
-
-	// Register stream with tracker for debugging
-	directionLabel := "receiver"
-	streamID := fmt.Sprintf("%s-%s-%s-%d",
-		ClusterShardIDtoString(clientShardID),
-		ClusterShardIDtoString(serverShardID),
-		directionLabel,
-		time.Now().UnixNano(),
-	)
-	streamTracker := GetGlobalStreamTracker()
-	streamTracker.RegisterStream(
-		streamID,
-		"StreamWorkflowReplicationMessages",
-		directionLabel,
-		ClusterShardIDtoString(clientShardID),
-		ClusterShardIDtoString(serverShardID),
-	)
-	defer streamTracker.UnregisterStream(streamID)
-
-	// Process outgoing responses (upstream → downstream)
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer func() {
-			logger.Info("Shutdown sourceStreamClient.Recv loop.")
-			shutdownChan.Shutdown()
-			wg.Done()
-		}()
-
-		for !shutdownChan.IsShutdown() {
-			resp, err := sourceStreamClient.Recv()
-			if err == io.EOF {
-				logger.Info("sourceStreamClient.Recv encountered EOF", tag.Error(err))
-				return
-			}
-			if err != nil {
-				logger.Error("sourceStreamClient.Recv encountered error", tag.Error(err))
-				return
-			}
-
-			streamTracker.UpdateStream(streamID)
-
-			switch attr := resp.GetAttributes().(type) {
-			case *adminservice.StreamWorkflowReplicationMessagesResponse_Messages:
-				logger.Info(fmt.Sprintf("processing ReplicationMessages: priority %v, exclusive %v, tasks: %v", attr.Messages.Priority, attr.Messages.ExclusiveHighWatermark, len(attr.Messages.ReplicationTasks)))
-
-				// Update stream tracker with ReplicationMessages information
-				streamTracker.UpdateStreamReplicationMessages(streamID, attr.Messages.ExclusiveHighWatermark)
-
-				// Process each replication task to recalculate target shard
-
-				// TODO: if replication tasks are empty, we should send the exclusive high watermark info to all target shards.
-				if len(attr.Messages.ReplicationTasks) == 0 {
-					logger.Info("Replication tasks are empty, sending exclusive high watermark info to all target shards")
-					for targetShardID, sendChan := range s.ps.proxy.GetAllRemoteSendChans() {
-						logger.Info("Sending high watermark to target shard", tag.NewStringTag("targetShard", ClusterShardIDtoString(targetShardID)))
-						sendChan <- resp
-					}
-				} else {
-					// TODO: use tasksByOwner instead of tasksByTargetShard when forwarding to another proxy
-					tasksByTargetShard := make(map[history.ClusterShardID][]*replicationv1.ReplicationTask)
-
-					for _, task := range attr.Messages.ReplicationTasks {
-						if task.RawTaskInfo != nil && task.RawTaskInfo.NamespaceId != "" && task.RawTaskInfo.WorkflowId != "" {
-							targetShardID := servercommon.WorkflowIDToHistoryShard(task.RawTaskInfo.NamespaceId, task.RawTaskInfo.WorkflowId, s.Config.ShardCountConfig.LocalShardCount)
-
-							logger.Info("Recalculated shard for workflow task",
-								tag.NewStringTag("namespaceId", task.RawTaskInfo.NamespaceId),
-								tag.NewStringTag("workflowId", task.RawTaskInfo.WorkflowId),
-								tag.NewStringTag("targetShard", fmt.Sprintf("%d", targetShardID)))
-
-							targetClusterShardID := history.ClusterShardID{
-								ClusterID: serverShardID.ClusterID,
-								ShardID:   targetShardID,
-							}
-							tasksByTargetShard[targetClusterShardID] = append(tasksByTargetShard[targetClusterShardID], task)
-						}
-					}
-
-					// TODO: Forward tasks to respective owner nodes
-					// For now, just do in-proxy routing
-					for targetShardID, tasks := range tasksByTargetShard {
-						logger.Info("Tasks to forward to target shard",
-							tag.NewStringTag("targetShard", ClusterShardIDtoString(targetShardID)),
-							tag.NewStringTag("taskCount", fmt.Sprintf("%d", len(tasks))))
-						sendChan, ok := s.ps.proxy.GetRemoteSendChan(targetShardID)
-						if !ok {
-							logger.Error("No send channel found for target shard", tag.NewStringTag("targetShard", ClusterShardIDtoString(targetShardID)))
-							continue
-						}
-						sendChan <- &adminservice.StreamWorkflowReplicationMessagesResponse{
-							Attributes: &adminservice.StreamWorkflowReplicationMessagesResponse_Messages{
-								Messages: &replicationv1.WorkflowReplicationMessages{
-									ReplicationTasks:       tasks,
-									ExclusiveHighWatermark: tasks[len(tasks)-1].RawTaskInfo.TaskId + 1,
-									Priority:               attr.Messages.Priority,
-									SourceShardId:          attr.Messages.SourceShardId,
-								},
-							},
-						}
-					}
-				}
-
-			default:
-				// For non-message responses, just forward as-is
-				logger.Info("Forwarding non-message response",
-					tag.NewStringTag("type", fmt.Sprintf("%T", attr)))
-			}
-
-		}
-	}()
-
-	go func() {
-		defer func() {
-			logger.Info("Shutdown sourceStreamClient.Recv loop.")
-			shutdownChan.Shutdown()
-			err := sourceStreamClient.CloseSend()
-			if err != nil {
-				logger.Error("Failed to close sourceStreamClient", tag.Error(err))
-			}
-			wg.Done()
-		}()
-
-		for !shutdownChan.IsShutdown() {
-			select {
-			case req := <-ackChan:
-				switch attr := req.GetAttributes().(type) {
-				case *adminservice.StreamWorkflowReplicationMessagesRequest_SyncReplicationState:
-					logger.Info(fmt.Sprintf("forwarding SyncReplicationState: inclusive %v", attr.SyncReplicationState.InclusiveLowWatermark))
-
-					// Initialize minimal ack with the original watermarks
-					minimalAck := &replicationv1.SyncReplicationState{
-						HighPriorityState: &replicationv1.ReplicationState{
-							InclusiveLowWatermark: math.MaxInt64,
-						},
-						LowPriorityState: &replicationv1.ReplicationState{
-							InclusiveLowWatermark: math.MaxInt64,
-						},
-					}
-					found := false
-
-					for sourceShardID, sourceShardState := range attr.SyncReplicationState.SourceShardStates {
-						if sourceShardID != clientShardID.ShardID {
-							continue
-						}
-
-						targetShardID := history.ClusterShardID{
-							ClusterID: serverShardID.ClusterID,
-							ShardID:   attr.SyncReplicationState.TargetShardId,
-						}
-						ackByTargetShard[targetShardID] = sourceShardState
-						found = true
-
-						logger.Info("Processing source shard state for aggregation",
-							tag.NewInt32("sourceShardID", sourceShardID),
-							tag.NewStringTag("targetShard", ClusterShardIDtoString(targetShardID)))
-					}
-
-					if !found {
-						logger.Error("No source shard state found for client shard", tag.NewInt32("clientShardID", clientShardID.ShardID))
-						return
-					}
-
-					// Aggregate minimal ack from all target shards
-					for _, sourceShardState := range ackByTargetShard {
-						// Compare high priority states - find minimum inclusive low watermark
-						if sourceShardState.HighPriorityState != nil && minimalAck.HighPriorityState != nil {
-							if sourceShardState.HighPriorityState.InclusiveLowWatermark < minimalAck.HighPriorityState.InclusiveLowWatermark {
-								minimalAck.HighPriorityState.InclusiveLowWatermark = sourceShardState.HighPriorityState.InclusiveLowWatermark
-							}
-						}
-						// Compare low priority states - find minimum inclusive low watermark
-						if sourceShardState.LowPriorityState != nil && minimalAck.LowPriorityState != nil {
-							if sourceShardState.LowPriorityState.InclusiveLowWatermark < minimalAck.LowPriorityState.InclusiveLowWatermark {
-								minimalAck.LowPriorityState.InclusiveLowWatermark = sourceShardState.LowPriorityState.InclusiveLowWatermark
-							}
-						}
-					}
-
-					// Create a new request with the minimal ack to send back to source shard
-					newReq := &adminservice.StreamWorkflowReplicationMessagesRequest{
-						Attributes: &adminservice.StreamWorkflowReplicationMessagesRequest_SyncReplicationState{
-							SyncReplicationState: &replicationv1.SyncReplicationState{
-								// TODO: tiered replication processing is not supported yet.
-								// HighPriorityState: minimalAck.HighPriorityState,
-								// LowPriorityState:  minimalAck.LowPriorityState,
-								InclusiveLowWatermark:     minimalAck.HighPriorityState.InclusiveLowWatermark,
-								InclusiveLowWatermarkTime: minimalAck.HighPriorityState.InclusiveLowWatermarkTime,
-								TargetShardId:             attr.SyncReplicationState.TargetShardId,
-							},
-						},
-					}
-
-					logger.Info("Sending aggregated ack with minimal watermarks",
-						tag.NewInt32("clientShardID", clientShardID.ShardID),
-						tag.NewInt64("highPriorityMinWatermark", minimalAck.HighPriorityState.InclusiveLowWatermark),
-						tag.NewInt64("lowPriorityMinWatermark", minimalAck.LowPriorityState.InclusiveLowWatermark))
-
-					if err = sourceStreamClient.Send(newReq); err != nil {
-						if err != io.EOF {
-							logger.Error("sourceStreamClient.Send encountered error", tag.Error(err))
-						} else {
-							logger.Info("sourceStreamClient.Send encountered EOF", tag.Error(err))
-						}
-						return
-					}
-
-					streamTracker.UpdateStream(streamID)
-					// Update stream tracker with SyncReplicationState information
-					var watermarkTime *time.Time
-					if minimalAck.HighPriorityState.InclusiveLowWatermarkTime != nil {
-						t := minimalAck.HighPriorityState.InclusiveLowWatermarkTime.AsTime()
-						watermarkTime = &t
-					}
-					streamTracker.UpdateStreamSyncReplicationState(streamID, minimalAck.HighPriorityState.InclusiveLowWatermark, watermarkTime)
-
-				default:
-					logger.Error("targetStreamServer.Recv encountered error", tag.Error(serviceerror.NewInternal(fmt.Sprintf(
-						"StreamWorkflowReplicationMessages encountered unknown type: %T %v", attr, attr,
-					))))
-					return
-				}
-
-			case <-shutdownChan.Channel():
-				// Shutdown requested, exit the loop
-				return
-			}
-		}
-	}()
-
-	wg.Wait()
-
-	return nil
-}
-
 func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 ) (retError error) {
@@ -756,23 +289,6 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	streamsActiveGauge.Inc()
 	defer streamsActiveGauge.Dec()
 
-	// Register stream with tracker for debugging
-	streamID := fmt.Sprintf("%s-%s-%s-%d",
-		ClusterShardIDtoString(clientShardID),
-		ClusterShardIDtoString(serverShardID),
-		directionLabel,
-		time.Now().UnixNano(),
-	)
-	streamTracker := GetGlobalStreamTracker()
-	streamTracker.RegisterStream(
-		streamID,
-		"StreamWorkflowReplicationMessages",
-		directionLabel,
-		ClusterShardIDtoString(clientShardID),
-		ClusterShardIDtoString(serverShardID),
-	)
-	defer streamTracker.UnregisterStream(streamID)
-
 	defer logger.Info("AdminStreamReplicationMessages stopped.")
 
 	if cfg := s.Config.ShardCountConfig; cfg.Mode == config.ShardCountLCM {
@@ -795,38 +311,40 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 		if s.IsInbound {
 			// Stream is going to local server. Remap shard id by local server shard count.
 			newServerShardID.ShardID = mapShardIDUnique(LCM, cfg.LocalShardCount, serverShardID.ShardID)
+			serverShardID = newServerShardID
+			// targetMetadata.Set(history.MetadataKeyServerClusterID, fmt.Sprintf("%d", newServerShardID.ClusterID))
+			targetMetadata.Set(history.MetadataKeyServerShardID, fmt.Sprintf("%d", newServerShardID.ShardID))
 		} else {
 			// Stream is going to remote server.
 			newClientShardID.ShardID = serverShardID.ShardID
+			clientShardID = newClientShardID
+			// targetMetadata.Set(history.MetadataKeyClientClusterID, fmt.Sprintf("%d", newClientShardID.ClusterID))
+			targetMetadata.Set(history.MetadataKeyClientShardID, fmt.Sprintf("%d", newClientShardID.ShardID))
 		}
 
 		logger = log.With(logger,
 			tag.NewStringTag("newClient", ClusterShardIDtoString(newClientShardID)),
 			tag.NewStringTag("newServer", ClusterShardIDtoString(newServerShardID)))
 
-		// Maybe there's a cleaner way. Trying to preserve any other metadata.
-		targetMetadata.Set(history.MetadataKeyClientClusterID, strconv.Itoa(int(newClientShardID.ClusterID)))
-		targetMetadata.Set(history.MetadataKeyClientShardID, strconv.Itoa(int(newClientShardID.ShardID)))
-		targetMetadata.Set(history.MetadataKeyServerClusterID, strconv.Itoa(int(newServerShardID.ClusterID)))
-		targetMetadata.Set(history.MetadataKeyServerShardID, strconv.Itoa(int(newServerShardID.ShardID)))
-
-		serverShardID = newServerShardID
 	}
 
-	if s.Config.ShardCountConfig.Mode == config.ShardCountFixed && s.Config.MemberlistConfig != nil && s.Config.MemberlistConfig.EnableForwarding {
-		return s.streamRouting(logger, targetStreamServer, streamTracker, streamID, targetMetadata, clientShardID, serverShardID)
+	// if s.Config.ShardCountConfig.Mode == config.ShardCountFixed && s.Config.MemberlistConfig != nil && s.Config.MemberlistConfig.EnableForwarding {
+	// 	return s.streamRouting(logger, targetStreamServer, streamTracker, streamID, targetMetadata, clientShardID, serverShardID)
+	// }
+	if s.Config.ShardCountConfig.Mode == config.ShardCountRouting {
+		return s.streamRouting(logger, targetStreamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
 	}
 
-	return s.streamForwarding(logger, targetStreamServer, streamTracker, streamID, targetMetadata, nil)
+	return s.streamForwarding(logger, targetStreamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
 }
 
 func (s *adminServiceProxyServer) streamForwarding(
 	logger log.Logger,
 	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
-	streamTracker *StreamTracker,
-	streamID string,
 	targetMetadata metadata.MD,
-	shutdownChan channel.ShutdownOnce,
+	clientShardID history.ClusterShardID,
+	serverShardID history.ClusterShardID,
+	directionLabel string,
 ) error {
 	logger.Info("stream forwarding started")
 
@@ -840,124 +358,76 @@ func (s *adminServiceProxyServer) streamForwarding(
 		return err
 	}
 
-	if shutdownChan == nil {
-		shutdownChan = channel.NewShutdownOnce()
+	forwarder := &proxyStreamForwarder{logger: logger}
+	shutdownChan := channel.NewShutdownOnce()
+	forwarder.Run(
+		directionLabel,
+		clientShardID,
+		serverShardID,
+		targetStreamServer,
+		sourceStreamClient,
+		shutdownChan,
+	)
+
+	return nil
+}
+
+// streamRouting handles stream routing for fixed shard count mode with forwarding enabled.
+// This function manages both inbound and outbound stream connections to ensure proper
+// shard ownership and paired stream lifecycle management.
+func (s *adminServiceProxyServer) streamRouting(
+	logger log.Logger,
+	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
+	targetMetadata metadata.MD,
+	targetShardID history.ClusterShardID,
+	sourceShardID history.ClusterShardID,
+	directionLabel string,
+) error {
+
+	// client: stream receiver
+	// server: stream sender
+	proxyStreamSender := &proxyStreamSender{
+		logger: logger,
+		// shardID:        clientShardID,
+		shardManager:   s.shardManager,
+		proxy:          s.ps.proxy,
+		sourceShardID:  targetShardID,
+		targetShardID:  sourceShardID,
+		directionLabel: directionLabel,
 	}
 
-	// Downstream (targetStreamServer) recv loop
+	var localShardCount int32
+	if s.IsInbound {
+		localShardCount = s.Config.ShardCountConfig.LocalShardCount
+	} else {
+		localShardCount = s.Config.ShardCountConfig.RemoteShardCount
+	}
+	// receiver for reverse direction
+	proxyStreamReceiverReverse := &proxyStreamReceiver{
+		logger: s.logger,
+		// shardID:         clientShardID,
+		shardManager:    s.shardManager,
+		proxyServer:     s.ps,
+		proxy:           s.ps.proxy,
+		localShardCount: localShardCount,
+		sourceShardID:   targetShardID,
+		targetShardID:   sourceShardID,
+		directionLabel:  directionLabel,
+	}
+
+	shutdownChan := channel.NewShutdownOnce()
+	wg := sync.WaitGroup{}
+	wg.Add(2)
 	go func() {
-		defer func() {
-			logger.Info("Shutdown targetStreamServer.Recv loop.")
-			shutdownChan.Shutdown()
-
-			err = sourceStreamClient.CloseSend()
-			if err != nil {
-				logger.Error("Failed to close sourceStreamClient", tag.Error(err))
-			}
-		}()
-
-		for !shutdownChan.IsShutdown() {
-			req, err := targetStreamServer.Recv()
-			if err == io.EOF {
-				logger.Info("targetStreamServer.Recv encountered EOF", tag.Error(err))
-				return
-			}
-
-			if err != nil {
-				logger.Error("targetStreamServer.Recv encountered error", tag.Error(err))
-				return
-			}
-
-			streamTracker.UpdateStream(streamID)
-
-			switch attr := req.GetAttributes().(type) {
-			case *adminservice.StreamWorkflowReplicationMessagesRequest_SyncReplicationState:
-				logger.Info(fmt.Sprintf("forwarding SyncReplicationState: inclusive %v, attr: %v", attr.SyncReplicationState.InclusiveLowWatermark, attr))
-
-				// Update stream tracker with SyncReplicationState information
-				var watermarkTime *time.Time
-				if attr.SyncReplicationState.InclusiveLowWatermarkTime != nil {
-					t := attr.SyncReplicationState.InclusiveLowWatermarkTime.AsTime()
-					watermarkTime = &t
-				}
-				streamTracker.UpdateStreamSyncReplicationState(streamID, attr.SyncReplicationState.InclusiveLowWatermark, watermarkTime)
-
-				if err = sourceStreamClient.Send(req); err != nil {
-					if err != io.EOF {
-						logger.Error("sourceStreamClient.Send encountered error", tag.Error(err))
-					} else {
-						logger.Info("sourceStreamClient.Send encountered EOF", tag.Error(err))
-					}
-					return
-				}
-			default:
-				logger.Error("targetStreamServer.Recv encountered error", tag.Error(serviceerror.NewInternal(fmt.Sprintf(
-					"StreamWorkflowReplicationMessages encountered unknown type: %T %v", attr, attr,
-				))))
-				return
-			}
-		}
+		defer wg.Done()
+		proxyStreamSender.Run(targetStreamServer, shutdownChan)
 	}()
-
-	// Upstream (sourceStreamClient) recv loop
-	// If Upstream recv loop failed (sourceStream server restart for example), StreamWorkflowReplicationMessages
-	// returns without waiting for Downstream loop to stop. This is because Downstream loop can be blocked at
-	// targetStreamServer.Recv, which prevent StreamWorkflowReplicationMessages from returning.
-	// Once StreamWorkflowReplicationMessages returns, targetStreamServer.Recv will be unblocked
-	// (see https://stackoverflow.com/questions/68218469/how-to-un-wedge-go-grpc-bidi-streaming-server-from-the-blocking-recv-call)
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer func() {
-			logger.Info("Shutdown sourceStreamClient.Recv loop.")
-
-			shutdownChan.Shutdown()
-			wg.Done()
-		}()
-
-		for !shutdownChan.IsShutdown() {
-			resp, err := sourceStreamClient.Recv()
-			if err == io.EOF {
-				logger.Info("sourceStreamClient.Recv encountered EOF", tag.Error(err))
-				return
-			}
-
-			if err != nil {
-				logger.Error("sourceStreamClient.Recv encountered error", tag.Error(err))
-				return
-			}
-
-			streamTracker.UpdateStream(streamID)
-
-			switch attr := resp.GetAttributes().(type) {
-			case *adminservice.StreamWorkflowReplicationMessagesResponse_Messages:
-				msg := make([]string, 0, len(attr.Messages.ReplicationTasks))
-				for i, task := range attr.Messages.ReplicationTasks {
-					msg = append(msg, fmt.Sprintf("[%d]: %v@%v", i, task.SourceTaskId, task.SourceShardId))
-				}
-				logger.Info(fmt.Sprintf("forwarding ReplicationMessages: exclusive %v, tasks: %v", attr.Messages.ExclusiveHighWatermark, strings.Join(msg, ", ")))
-
-				// Update stream tracker with ReplicationMessages information
-				streamTracker.UpdateStreamReplicationMessages(streamID, attr.Messages.ExclusiveHighWatermark)
-
-				if err = targetStreamServer.Send(resp); err != nil {
-					if err != io.EOF {
-						logger.Error("targetStreamServer.Send encountered error", tag.Error(err))
-					} else {
-						logger.Info("targetStreamServer.Send encountered EOF", tag.Error(err))
-					}
-					return
-				}
-			default:
-				logger.Error("sourceStreamClient.Recv encountered error", tag.Error(serviceerror.NewInternal(fmt.Sprintf(
-					"StreamWorkflowReplicationMessages encountered unknown type: %T %v", attr, attr,
-				))))
-				return
-			}
-		}
+		defer wg.Done()
+		proxyStreamReceiverReverse.Run(shutdownChan)
 	}()
-
 	wg.Wait()
+
 	return nil
 }
 

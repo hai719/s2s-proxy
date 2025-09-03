@@ -242,6 +242,6 @@ func translateOneDataBlob(match stringMatcher, visitor visitor, blob *common.Dat
 		return blob, changed, err
 	}
 
-	newBlob, err := serializer.SerializeEvents(evt)
+	newBlob, err := serializer.SerializeEvents(evt, blob.EncodingType)
 	return newBlob, changed, err
 }
