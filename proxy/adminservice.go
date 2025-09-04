@@ -391,8 +391,8 @@ func (s *adminServiceProxyServer) streamRouting(
 		// shardID:        clientShardID,
 		shardManager:   s.shardManager,
 		proxy:          s.ps.proxy,
-		sourceShardID:  targetShardID,
-		targetShardID:  sourceShardID,
+		sourceShardID:  sourceShardID,
+		targetShardID:  targetShardID,
 		directionLabel: directionLabel,
 	}
 
