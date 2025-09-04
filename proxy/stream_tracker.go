@@ -17,19 +17,19 @@ type StreamInfo struct {
 	ID                         string             `json:"id"`
 	Method                     string             `json:"method"`
 	Direction                  string             `json:"direction"`
-	Role                       string             `json:"role,omitempty"`
+	Role                       string             `json:"role"`
 	ClientShard                string             `json:"client_shard"`
 	ServerShard                string             `json:"server_shard"`
 	StartTime                  time.Time          `json:"start_time"`
 	LastSeen                   time.Time          `json:"last_seen"`
 	TotalDuration              string             `json:"total_duration"`
 	IdleDuration               string             `json:"idle_duration"`
-	LastSyncWatermark          *int64             `json:"last_sync_watermark,omitempty"`
-	LastSyncWatermarkTime      *time.Time         `json:"last_sync_watermark_time,omitempty"`
-	LastExclusiveHighWatermark *int64             `json:"last_exclusive_high_watermark,omitempty"`
+	LastSyncWatermark          *int64             `json:"last_sync_watermark"`
+	LastSyncWatermarkTime      *time.Time         `json:"last_sync_watermark_time"`
+	LastExclusiveHighWatermark *int64             `json:"last_exclusive_high_watermark"`
 	LastTaskIDs                []int64            `json:"last_task_ids"`
-	SenderDebug                *SenderDebugInfo   `json:"sender_debug,omitempty"`
-	ReceiverDebug              *ReceiverDebugInfo `json:"receiver_debug,omitempty"`
+	SenderDebug                *SenderDebugInfo   `json:"sender_debug"`
+	ReceiverDebug              *ReceiverDebugInfo `json:"receiver_debug"`
 }
 
 // StreamTracker tracks active gRPC streams for debugging
@@ -119,15 +119,15 @@ func (st *StreamTracker) UnregisterStream(id string) {
 
 // SenderDebugInfo captures proxy-stream-sender internals for debugging
 type SenderDebugInfo struct {
-	RingStartProxyID      int64            `json:"ring_start_proxy_id,omitempty"`
-	RingSize              int              `json:"ring_size,omitempty"`
-	RingCapacity          int              `json:"ring_capacity,omitempty"`
-	RingHead              int              `json:"ring_head,omitempty"`
-	NextProxyTaskID       int64            `json:"next_proxy_task_id,omitempty"`
-	PrevAckBySource       map[string]int64 `json:"prev_ack_by_source,omitempty"`
-	LastHighBySource      map[string]int64 `json:"last_high_by_source,omitempty"`
-	LastProxyHighBySource map[string]int64 `json:"last_proxy_high_by_source,omitempty"`
-	EntriesPreview        []ProxyIDEntry   `json:"entries_preview,omitempty"`
+	RingStartProxyID      int64            `json:"ring_start_proxy_id"`
+	RingSize              int              `json:"ring_size"`
+	RingCapacity          int              `json:"ring_capacity"`
+	RingHead              int              `json:"ring_head"`
+	NextProxyTaskID       int64            `json:"next_proxy_task_id"`
+	PrevAckBySource       map[string]int64 `json:"prev_ack_by_source"`
+	LastHighBySource      map[string]int64 `json:"last_high_by_source"`
+	LastProxyHighBySource map[string]int64 `json:"last_proxy_high_by_source"`
+	EntriesPreview        []ProxyIDEntry   `json:"entries_preview"`
 }
 
 // ProxyIDEntry is a preview of a ring buffer entry
@@ -139,9 +139,9 @@ type ProxyIDEntry struct {
 
 // ReceiverDebugInfo captures proxy-stream-receiver ack aggregation state
 type ReceiverDebugInfo struct {
-	AckByTarget               map[string]int64 `json:"ack_by_target,omitempty"`
-	LastAggregatedMin         int64            `json:"last_aggregated_min,omitempty"`
-	LastExclusiveHighOriginal int64            `json:"last_exclusive_high_original,omitempty"`
+	AckByTarget               map[string]int64 `json:"ack_by_target"`
+	LastAggregatedMin         int64            `json:"last_aggregated_min"`
+	LastExclusiveHighOriginal int64            `json:"last_exclusive_high_original"`
 }
 
 // UpdateStreamSenderDebug sets the sender debug snapshot for a stream
