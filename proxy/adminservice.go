@@ -277,6 +277,8 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	logger := log.With(s.logger,
 		tag.NewStringTag("client", ClusterShardIDtoString(clientShardID)),
 		tag.NewStringTag("server", ClusterShardIDtoString(serverShardID)),
+		tag.NewStringTag("stream-source-shard", ClusterShardIDtoString(serverShardID)),
+		tag.NewStringTag("stream-target-shard", ClusterShardIDtoString(clientShardID)),
 	)
 
 	// Record streams active
@@ -387,8 +389,7 @@ func (s *adminServiceProxyServer) streamRouting(
 	// client: stream receiver
 	// server: stream sender
 	proxyStreamSender := &proxyStreamSender{
-		logger: logger,
-		// shardID:        clientShardID,
+		logger:         logger,
 		shardManager:   s.shardManager,
 		proxy:          s.ps.proxy,
 		sourceShardID:  sourceShardID,
@@ -404,8 +405,7 @@ func (s *adminServiceProxyServer) streamRouting(
 	}
 	// receiver for reverse direction
 	proxyStreamReceiverReverse := &proxyStreamReceiver{
-		logger: s.logger,
-		// shardID:         clientShardID,
+		logger:          s.logger,
 		shardManager:    s.shardManager,
 		proxyServer:     s.ps,
 		proxy:           s.ps.proxy,
