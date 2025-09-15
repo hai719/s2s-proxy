@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.temporal.io/server/common/log/tag"
 	"google.golang.org/grpc/metadata"
@@ -65,4 +66,29 @@ func LCM(a, b int32) int32 {
 		return 0
 	}
 	return a * b / GCD(a, b)
+}
+
+// StreamInfo represents information about an active gRPC stream
+type StreamInfo struct {
+	ID          string    `json:"id"`
+	Method      string    `json:"method"`
+	Direction   string    `json:"direction"`
+	ClientShard string    `json:"client_shard"`
+	ServerShard string    `json:"server_shard"`
+	StartTime   time.Time `json:"start_time"`
+	LastSeen    time.Time `json:"last_seen"`
+}
+
+// ConnectionInfo represents debug information about a connection
+type ConnectionInfo struct {
+	Name          string       `json:"name"`
+	Type          string       `json:"type"`
+	Status        string       `json:"status"`
+	LocalAddr     string       `json:"local_addr,omitempty"`
+	RemoteAddr    string       `json:"remote_addr,omitempty"`
+	Connected     bool         `json:"connected"`
+	StartTime     time.Time    `json:"start_time,omitempty"`
+	LastSeen      time.Time    `json:"last_seen,omitempty"`
+	Streams       int          `json:"streams,omitempty"`
+	ActiveStreams []StreamInfo `json:"active_streams,omitempty"`
 }

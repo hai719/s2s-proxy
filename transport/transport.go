@@ -1,14 +1,14 @@
 package transport
 
 import (
-	"fmt"
-	"time"
-
 	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/log/tag"
 	"google.golang.org/grpc"
 
+	"github.com/temporalio/s2s-proxy/common"
 	"github.com/temporalio/s2s-proxy/config"
+	"github.com/temporalio/s2s-proxy/transport/mux"
 )
 
 type (
@@ -18,6 +18,7 @@ type (
 
 	ServerTransport interface {
 		Serve(server *grpc.Server) error
+		IsClosed() bool
 	}
 
 	Closable interface {
@@ -31,33 +32,8 @@ type (
 		Closable
 	}
 
-	// StreamInfo represents information about an active gRPC stream
-	StreamInfo struct {
-		ID          string    `json:"id"`
-		Method      string    `json:"method"`
-		Direction   string    `json:"direction"`
-		ClientShard string    `json:"client_shard"`
-		ServerShard string    `json:"server_shard"`
-		StartTime   time.Time `json:"start_time"`
-		LastSeen    time.Time `json:"last_seen"`
-	}
-
-	// ConnectionInfo represents debug information about a connection
-	ConnectionInfo struct {
-		Name          string       `json:"name"`
-		Type          string       `json:"type"`
-		Status        string       `json:"status"`
-		LocalAddr     string       `json:"local_addr,omitempty"`
-		RemoteAddr    string       `json:"remote_addr,omitempty"`
-		Connected     bool         `json:"connected"`
-		StartTime     time.Time    `json:"start_time,omitempty"`
-		LastSeen      time.Time    `json:"last_seen,omitempty"`
-		Streams       int          `json:"streams,omitempty"`
-		ActiveStreams []StreamInfo `json:"active_streams,omitempty"`
-	}
-
 	TransportManager struct {
-		muxConnManagers map[string]*muxConnectManager
+		muxConnManagers map[string]mux.MuxManager
 		logger          log.Logger
 	}
 )
@@ -67,10 +43,15 @@ func NewTransportManager(
 	logger log.Logger,
 ) *TransportManager {
 
-	muxConnManagers := make(map[string]*muxConnectManager)
+	muxConnManagers := make(map[string]mux.MuxManager)
 	s2sConfig := configProvider.GetS2SProxyConfig()
 	for _, cfg := range s2sConfig.MuxTransports {
-		muxConnManagers[cfg.Name] = newMuxConnectManager(cfg, logger)
+		muxMgr, err := mux.NewMuxManager(cfg, logger)
+		if err != nil {
+			logger.Fatal("Failed to configure mux manager", tag.Error(err))
+			panic(err)
+		}
+		muxConnManagers[cfg.Name] = muxMgr
 	}
 
 	return &TransportManager{
@@ -78,22 +59,14 @@ func NewTransportManager(
 		logger:          logger,
 	}
 }
-
-func (tm *TransportManager) openMuxTransport(transportName string) (MuxTransport, error) {
-	mux := tm.muxConnManagers[transportName]
-	if mux == nil {
-		return nil, fmt.Errorf("multiplexed transport %s is not found", transportName)
-	}
-
-	return mux.open()
-}
 func (tm *TransportManager) IsMuxActive(name string) bool {
-	return tm.muxConnManagers[name].status.Load() == int32(statusStarted)
+	//return tm.muxConnManagers[name].Load() == int32(statusStarted)
+	return tm.muxConnManagers[name].TryConnectionOrElse(func(*mux.SessionWithConn) any { return true }, false).(bool)
 }
 
 func (tm *TransportManager) OpenClient(clientConfig config.ProxyClientConfig) (ClientTransport, error) {
 	if clientConfig.Type == config.MuxTransport {
-		return tm.openMuxTransport(clientConfig.MuxTransportName)
+		return tm.muxConnManagers[clientConfig.MuxTransportName], nil
 	}
 
 	return &tcpClient{
@@ -103,7 +76,7 @@ func (tm *TransportManager) OpenClient(clientConfig config.ProxyClientConfig) (C
 
 func (tm *TransportManager) OpenServer(serverConfig config.ProxyServerConfig) (ServerTransport, error) {
 	if serverConfig.Type == config.MuxTransport {
-		return tm.openMuxTransport(serverConfig.MuxTransportName)
+		return tm.muxConnManagers[serverConfig.MuxTransportName], nil
 	}
 
 	return &tcpServer{
@@ -115,9 +88,7 @@ func (tm *TransportManager) Start() error {
 	tm.logger.Info("Starting TransportManager")
 	defer tm.logger.Info("TransportManager started")
 	for _, cm := range tm.muxConnManagers {
-		if err := cm.start(); err != nil {
-			return err
-		}
+		cm.Start()
 	}
 
 	return nil
@@ -127,16 +98,16 @@ func (tm *TransportManager) Stop() {
 	tm.logger.Info("Stopping TransportManager")
 	defer tm.logger.Info("TransportManager stopped")
 	for _, cm := range tm.muxConnManagers {
-		cm.stop()
+		cm.Close()
 	}
 }
 
 // GetConnectionInfo returns debug information about all active connections
-func (tm *TransportManager) GetConnectionInfo() []ConnectionInfo {
-	var connections []ConnectionInfo
+func (tm *TransportManager) GetConnectionInfo() []common.ConnectionInfo {
+	var connections []common.ConnectionInfo
 
 	for name, manager := range tm.muxConnManagers {
-		info := manager.getConnectionInfo(name)
+		info := manager.GetConnectionInfo(name)
 		connections = append(connections, info...)
 	}
 

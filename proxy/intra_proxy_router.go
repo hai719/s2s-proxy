@@ -21,7 +21,7 @@ import (
 	"github.com/temporalio/s2s-proxy/common"
 	"github.com/temporalio/s2s-proxy/config"
 	"github.com/temporalio/s2s-proxy/encryption"
-	"github.com/temporalio/s2s-proxy/transport"
+	"github.com/temporalio/s2s-proxy/transport/grpcutil"
 )
 
 // intraProxyManager maintains long-lived intra-proxy streams to peer proxies and
@@ -412,7 +412,7 @@ func (m *intraProxyManager) ensurePeer(
 	}
 	// Reuse default grpc options from transport
 	dialOpts = append(dialOpts,
-		grpc.WithDefaultServiceConfig(transport.DefaultServiceConfig),
+		grpc.WithDefaultServiceConfig(grpcutil.DefaultServiceConfig),
 		grpc.WithDisableServiceConfig(),
 	)
 

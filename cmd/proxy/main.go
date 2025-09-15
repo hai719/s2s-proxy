@@ -15,6 +15,7 @@ import (
 	"go.uber.org/fx"
 
 	"github.com/temporalio/s2s-proxy/client"
+	"github.com/temporalio/s2s-proxy/common"
 	"github.com/temporalio/s2s-proxy/config"
 	"github.com/temporalio/s2s-proxy/proto/compat"
 	"github.com/temporalio/s2s-proxy/proxy"
@@ -34,12 +35,12 @@ type ProxyParams struct {
 }
 
 type DebugResponse struct {
-	Timestamp     time.Time                  `json:"timestamp"`
-	Connections   []transport.ConnectionInfo `json:"connections"`
-	ActiveStreams []proxy.StreamInfo         `json:"active_streams"`
-	StreamCount   int                        `json:"stream_count"`
-	ShardInfo     proxy.ShardDebugInfo       `json:"shard_info"`
-	ChannelInfo   proxy.ChannelDebugInfo     `json:"channel_info"`
+	Timestamp     time.Time               `json:"timestamp"`
+	Connections   []common.ConnectionInfo `json:"connections"`
+	ActiveStreams []proxy.StreamInfo      `json:"active_streams"`
+	StreamCount   int                     `json:"stream_count"`
+	ShardInfo     proxy.ShardDebugInfo    `json:"shard_info"`
+	ChannelInfo   proxy.ChannelDebugInfo  `json:"channel_info"`
 }
 
 func run(args []string) error {
@@ -98,7 +99,7 @@ func startPProfHTTPServer(logger log.Logger, c config.ProfilingConfig, proxyInst
 func handleDebugConnections(w http.ResponseWriter, r *http.Request, proxyInstance *proxy.Proxy, logger log.Logger) {
 	w.Header().Set("Content-Type", "application/json")
 
-	var connections []transport.ConnectionInfo
+	var connections []common.ConnectionInfo
 	var activeStreams []proxy.StreamInfo
 	var streamCount int
 	var shardInfo proxy.ShardDebugInfo

@@ -21,6 +21,7 @@ import (
 	"github.com/temporalio/s2s-proxy/auth"
 	"github.com/temporalio/s2s-proxy/client"
 	adminclient "github.com/temporalio/s2s-proxy/client/admin"
+	"github.com/temporalio/s2s-proxy/common"
 	"github.com/temporalio/s2s-proxy/config"
 	"github.com/temporalio/s2s-proxy/encryption"
 	"github.com/temporalio/s2s-proxy/interceptor"
@@ -547,7 +548,7 @@ func (s *Proxy) Stop() {
 }
 
 // GetConnectionInfo returns debug information about active connections
-func (s *Proxy) GetConnectionInfo() []transport.ConnectionInfo {
+func (s *Proxy) GetConnectionInfo() []common.ConnectionInfo {
 	return s.transManager.GetConnectionInfo()
 }
 
