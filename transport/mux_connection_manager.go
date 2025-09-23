@@ -324,7 +324,10 @@ func (m *muxConnectMananger) stop() {
 
 // getConnectionInfo returns debug information about this connection manager
 func (m *muxConnectMananger) getConnectionInfo(name string) []ConnectionInfo {
-	m.mu.Lock()
+	// Best-effort: avoid blocking callers (e.g., debug endpoint) if the manager is busy
+	if !m.mu.TryLock() {
+		return []ConnectionInfo{}
+	}
 	defer m.mu.Unlock()
 
 	var connections []ConnectionInfo

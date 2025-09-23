@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 
 	grpcprom "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
@@ -68,6 +69,7 @@ type (
 		metricsServer     *http.Server
 		shardManager      ShardManager
 		logger            log.Logger
+		intraMgr          *intraProxyManager
 
 		// remoteSendChannels maps shard IDs to send channels for replication message routing
 		remoteSendChannels   map[history.ClusterShardID]chan RoutedMessage
@@ -303,6 +305,37 @@ func NewProxy(
 		localReceiverCancelFuncs: make(map[history.ClusterShardID]context.CancelFunc),
 	}
 
+	// Initialize intra-proxy manager for peer communication
+	proxy.intraMgr = newIntraProxyManager(logger)
+
+	// Wire memberlist peer-join callback to reconcile intra-proxy receivers for local/remote pairs
+	shardManager.SetOnPeerJoin(func(nodeName string) {
+		logger.Info("OnPeerJoin", tag.NewStringTag("nodeName", nodeName))
+		defer logger.Info("OnPeerJoin done", tag.NewStringTag("nodeName", nodeName))
+		proxy.intraMgr.ReconcilePeerStreams(proxy, nodeName)
+	})
+
+	// Wire peer-leave to cleanup intra-proxy resources for that peer
+	shardManager.SetOnPeerLeave(func(nodeName string) {
+		logger.Info("OnPeerLeave", tag.NewStringTag("nodeName", nodeName))
+		defer logger.Info("OnPeerLeave done", tag.NewStringTag("nodeName", nodeName))
+		proxy.intraMgr.ReconcilePeerStreams(proxy, nodeName)
+	})
+
+	// Wire local shard changes to reconcile intra-proxy receivers
+	shardManager.SetOnLocalShardChange(func(shard history.ClusterShardID, added bool) {
+		logger.Info("OnLocalShardChange", tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
+		defer logger.Info("OnLocalShardChange done", tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
+		proxy.intraMgr.ReconcilePeerStreams(proxy, "")
+	})
+
+	// Wire remote shard changes to reconcile intra-proxy receivers
+	shardManager.SetOnRemoteShardChange(func(peer string, shard history.ClusterShardID, added bool) {
+		logger.Info("OnRemoteShardChange", tag.NewStringTag("peer", peer), tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
+		defer logger.Info("OnRemoteShardChange done", tag.NewStringTag("peer", peer), tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
+		proxy.intraMgr.ReconcilePeerStreams(proxy, peer)
+	})
+
 	// Proxy consists of two grpc servers: inbound and outbound. The flow looks like the following:
 	//    local server -> proxy(outbound) -> remote server
 	//    local server <- proxy(inbound) <- remote server
@@ -405,7 +438,6 @@ func (s *Proxy) Start() error {
 			` it needs at least the following path: metrics.prometheus.listenAddress`)
 	}
 
-	// Start shard manager if enabled
 	if err := s.shardManager.Start(); err != nil {
 		return err
 	}
@@ -493,6 +525,11 @@ func (s *Proxy) GetChannelInfo() ChannelDebugInfo {
 		TotalSendChannels:  totalSendChannels,
 		TotalAckChannels:   totalAckChannels,
 	}
+}
+
+// GetIntraProxyManager returns the intra-proxy manager instance
+func (s *Proxy) GetIntraProxyManager() *intraProxyManager {
+	return s.intraMgr
 }
 
 // SetRemoteSendChan registers a send channel for a specific shard ID

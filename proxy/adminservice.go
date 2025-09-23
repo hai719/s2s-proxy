@@ -43,10 +43,14 @@ func NewAdminServiceProxyServer(
 	logger log.Logger,
 ) adminservice.AdminServiceServer {
 	logger = log.With(logger, common.ServiceTag(serviceName))
-	// clientProvider := client.NewClientProvider(clientConfig, clientFactory, logger)
+	// Prefer a concrete admin client from factory for tests and non-lazy usage
+	if clientFactory != nil {
+		if c, err := clientFactory.NewRemoteAdminClient(clientConfig); err == nil && c != nil {
+			adminClient = c
+		}
+	}
 	return &adminServiceProxyServer{
-		ps: ps,
-		// adminClient:  adminclient.NewLazyClient(clientProvider),
+		ps:           ps,
 		adminClient:  adminClient,
 		shardManager: shardManager,
 		logger:       logger,
@@ -252,6 +256,10 @@ func ClusterShardIDtoString(sd history.ClusterShardID) string {
 	return fmt.Sprintf("(id: %d, shard: %d)", sd.ClusterID, sd.ShardID)
 }
 
+func ClusterShardIDtoShortString(sd history.ClusterShardID) string {
+	return fmt.Sprintf("%d:%d", sd.ClusterID, sd.ShardID)
+}
+
 func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 ) (retError error) {
@@ -268,8 +276,11 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 		return err
 	}
 
-	// Register this shard as handled by this proxy
-	if !s.IsInbound {
+	// Detect intra-proxy streams early for logging/behavior toggles
+	isIntraProxy := common.IsIntraProxy(targetStreamServer.Context())
+
+	if !isIntraProxy && !s.IsInbound {
+		// Register this shard as handled by this proxy
 		s.shardManager.RegisterShard(clientShardID)
 		defer s.shardManager.UnregisterShard(clientShardID)
 	}
@@ -282,9 +293,11 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	)
 
 	// Record streams active
-	directionLabel := "inbound"
-	if !s.IsInbound {
-		directionLabel = "outbound"
+	directionLabel := "outbound"
+	if isIntraProxy {
+		directionLabel = "intra-proxy"
+	} else if s.IsInbound {
+		directionLabel = "inbound"
 	}
 	logger.Info("AdminStreamReplicationMessages started.")
 	streamsActiveGauge := metrics.AdminServiceStreamsActive.WithLabelValues(directionLabel)
@@ -330,9 +343,10 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 
 	}
 
-	// if s.Config.ShardCountConfig.Mode == config.ShardCountFixed && s.Config.MemberlistConfig != nil && s.Config.MemberlistConfig.EnableForwarding {
-	// 	return s.streamRouting(logger, targetStreamServer, streamTracker, streamID, targetMetadata, clientShardID, serverShardID)
-	// }
+	if isIntraProxy {
+		return s.streamIntraProxyRouting(logger, targetStreamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
+	}
+
 	if s.Config.ShardCountConfig.Mode == config.ShardCountRouting {
 		return s.streamRouting(logger, targetStreamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
 	}
@@ -371,6 +385,53 @@ func (s *adminServiceProxyServer) streamForwarding(
 		shutdownChan,
 	)
 
+	return nil
+}
+
+func (s *adminServiceProxyServer) streamIntraProxyRouting(
+	logger log.Logger,
+	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
+	targetMetadata metadata.MD,
+	clientShardID history.ClusterShardID,
+	serverShardID history.ClusterShardID,
+	directionLabel string,
+) error {
+	logger.Info("intra-proxy routing started")
+
+	// Determine remote peer identity from intra-proxy headers
+	peerNodeName := ""
+	if md, ok := metadata.FromIncomingContext(targetStreamServer.Context()); ok {
+		vals := md.Get(common.IntraProxyOriginProxyIDHeader)
+		if len(vals) > 0 {
+			peerNodeName = vals[0]
+		}
+	}
+
+	// Only allow intra-proxy when at least one shard is local to this proxy instance
+	isLocalClient := s.shardManager.IsLocalShard(clientShardID)
+	isLocalServer := s.shardManager.IsLocalShard(serverShardID)
+	if (isLocalClient && isLocalServer) || (!isLocalClient && !isLocalServer) {
+		logger.Info("Skipping intra-proxy between two local shards or two remote shards. Client may use outdated shard info.",
+			tag.NewStringTag("client", ClusterShardIDtoString(clientShardID)),
+			tag.NewStringTag("server", ClusterShardIDtoString(serverShardID)))
+		return nil
+	}
+
+	// Sender: handle ACKs coming from peer and forward to original owner
+	sender := &intraProxyStreamSender{
+		logger:        logger,
+		shardManager:  s.shardManager,
+		proxy:         s.ps.proxy,
+		intraMgr:      s.ps.proxy.intraMgr,
+		peerNodeName:  peerNodeName,
+		targetShardID: clientShardID,
+		sourceShardID: serverShardID,
+	}
+
+	shutdownChan := channel.NewShutdownOnce()
+	go sender.Run(targetStreamServer, shutdownChan)
+
+	<-shutdownChan.Channel()
 	return nil
 }
 

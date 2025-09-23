@@ -249,10 +249,8 @@ func (s *proxyStreamSender) Run(
 
 	// Register local stream tracking for sender (short id, include role)
 	s.streamTracker = GetGlobalStreamTracker()
-	s.streamID = fmt.Sprintf("snd-%s-%s",
-		ClusterShardIDtoString(s.sourceShardID),
-		ClusterShardIDtoString(s.targetShardID),
-	)
+	s.streamID = BuildSenderStreamID(s.sourceShardID, s.targetShardID)
+	s.logger = log.With(s.logger, tag.NewStringTag("streamID", s.streamID))
 	s.streamTracker.RegisterStream(
 		s.streamID,
 		"StreamWorkflowReplicationMessages",
@@ -360,7 +358,7 @@ func (s *proxyStreamSender) recvAck(
 
 						s.logger.Info("Sender forwarding ACK to source shard", tag.NewStringTag("sourceShard", ClusterShardIDtoString(srcShard)), tag.NewInt64("ack", originalAck))
 
-						if s.shardManager.DeliverAckToShardOwner(srcShard, routedAck, s.proxy, shutdownChan, s.logger) {
+						if s.shardManager.DeliverAckToShardOwner(srcShard, routedAck, s.proxy, shutdownChan, s.logger, originalAck, true) {
 							sent[srcShard] = true
 							numRemaining--
 							progress = true
@@ -422,7 +420,7 @@ func (s *proxyStreamSender) recvAck(
 						}
 						// Log fallback ACK for this source shard
 						s.logger.Info("Sender forwarding fallback ACK to source shard", tag.NewStringTag("sourceShard", ClusterShardIDtoString(srcShard)), tag.NewInt64("ack", prev))
-						if s.shardManager.DeliverAckToShardOwner(srcShard, routedAck, s.proxy, shutdownChan, s.logger) {
+						if s.shardManager.DeliverAckToShardOwner(srcShard, routedAck, s.proxy, shutdownChan, s.logger, prev, true) {
 							sent[srcShard] = true
 							numRemaining--
 							progress = true
@@ -620,10 +618,8 @@ func (r *proxyStreamReceiver) Run(
 	r.lastSentMin = 0
 
 	// Register a new local stream for tracking (short id, include role)
-	r.streamID = fmt.Sprintf("rcv-%s-%s",
-		ClusterShardIDtoString(r.sourceShardID),
-		ClusterShardIDtoString(r.targetShardID),
-	)
+	r.streamID = BuildReceiverStreamID(r.sourceShardID, r.targetShardID)
+	r.logger = log.With(r.logger, tag.NewStringTag("streamID", r.streamID))
 	r.streamTracker = GetGlobalStreamTracker()
 	r.streamTracker.RegisterStream(
 		r.streamID,
@@ -740,27 +736,22 @@ func (r *proxyStreamReceiver) recvReplicationMessages(
 					if sentByTarget[targetShardID] {
 						continue
 					}
-					if ch, ok := r.proxy.GetRemoteSendChan(targetShardID); ok {
-						msg := RoutedMessage{
-							SourceShard: r.sourceShardID,
-							Resp: &adminservice.StreamWorkflowReplicationMessagesResponse{
-								Attributes: &adminservice.StreamWorkflowReplicationMessagesResponse_Messages{
-									Messages: &replicationv1.WorkflowReplicationMessages{
-										ReplicationTasks:       tasks,
-										ExclusiveHighWatermark: tasks[len(tasks)-1].RawTaskInfo.TaskId + 1,
-										Priority:               attr.Messages.Priority,
-									},
+					msg := RoutedMessage{
+						SourceShard: r.sourceShardID,
+						Resp: &adminservice.StreamWorkflowReplicationMessagesResponse{
+							Attributes: &adminservice.StreamWorkflowReplicationMessagesResponse_Messages{
+								Messages: &replicationv1.WorkflowReplicationMessages{
+									ReplicationTasks:       tasks,
+									ExclusiveHighWatermark: tasks[len(tasks)-1].RawTaskInfo.TaskId + 1,
+									Priority:               attr.Messages.Priority,
 								},
 							},
-						}
-						select {
-						case ch <- msg:
-							sentByTarget[targetShardID] = true
-							numRemaining--
-							progress = true
-						case <-shutdownChan.Channel():
-							return nil
-						}
+						},
+					}
+					if r.shardManager.DeliverMessagesToShardOwner(targetShardID, &msg, r.proxy, shutdownChan, r.logger) {
+						sentByTarget[targetShardID] = true
+						numRemaining--
+						progress = true
 					} else {
 						if !loggedByTarget[targetShardID] {
 							r.logger.Warn("No send channel found for target shard; retrying until available", tag.NewStringTag("targetShard", ClusterShardIDtoString(targetShardID)))
@@ -847,7 +838,8 @@ func (r *proxyStreamReceiver) sendAck(
 // proxyStreamForwarder forwards between a downstream server stream and an upstream
 // client stream. It is used when the proxy acts as a pure pass-through.
 type proxyStreamForwarder struct {
-	logger log.Logger
+	logger   log.Logger
+	streamID string
 }
 
 func (f *proxyStreamForwarder) Run(
@@ -866,23 +858,23 @@ func (f *proxyStreamForwarder) Run(
 	streamTracker := GetGlobalStreamTracker()
 	clientShard := ClusterShardIDtoString(clientShardID)
 	serverShard := ClusterShardIDtoString(serverShardID)
-	streamID := fmt.Sprintf("fwd-%s-%s", serverShard, clientShard)
-	streamTracker.RegisterStream(streamID, "StreamWorkflowReplicationMessages", directionLabel, clientShard, serverShard, StreamRoleForwarder)
-	defer streamTracker.UnregisterStream(streamID)
+	f.streamID = BuildForwarderStreamID(clientShardID, serverShardID)
+	f.logger = log.With(f.logger, tag.NewStringTag("streamID", f.streamID))
+	streamTracker.RegisterStream(f.streamID, "StreamWorkflowReplicationMessages", directionLabel, clientShard, serverShard, StreamRoleForwarder)
+	defer streamTracker.UnregisterStream(f.streamID)
 
 	// targetStreamServer: sender
 	// sourceStreamClient: receiver
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go f.forwardAck(streamTracker, streamID, targetStreamServer, sourceStreamClient, shutdownChan, &wg)
-	go f.forwardReplicationMessages(streamTracker, streamID, targetStreamServer, sourceStreamClient, shutdownChan, &wg)
+	go f.forwardAck(streamTracker, targetStreamServer, sourceStreamClient, shutdownChan, &wg)
+	go f.forwardReplicationMessages(streamTracker, targetStreamServer, sourceStreamClient, shutdownChan, &wg)
 	wg.Wait()
 }
 
 func (f *proxyStreamForwarder) forwardAck(
 	streamTracker *StreamTracker,
-	streamID string,
 	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 	sourceStreamClient adminservice.AdminService_StreamWorkflowReplicationMessagesClient,
 	shutdownChan channel.ShutdownOnce,
@@ -910,7 +902,7 @@ func (f *proxyStreamForwarder) forwardAck(
 			return
 		}
 
-		streamTracker.UpdateStream(streamID)
+		streamTracker.UpdateStream(f.streamID)
 
 		switch attr := req.GetAttributes().(type) {
 		case *adminservice.StreamWorkflowReplicationMessagesRequest_SyncReplicationState:
@@ -921,7 +913,7 @@ func (f *proxyStreamForwarder) forwardAck(
 				t := attr.SyncReplicationState.InclusiveLowWatermarkTime.AsTime()
 				watermarkTime = &t
 			}
-			streamTracker.UpdateStreamSyncReplicationState(streamID, attr.SyncReplicationState.InclusiveLowWatermark, watermarkTime)
+			streamTracker.UpdateStreamSyncReplicationState(f.streamID, attr.SyncReplicationState.InclusiveLowWatermark, watermarkTime)
 
 			if err = sourceStreamClient.Send(req); err != nil {
 				if err != io.EOF {
@@ -942,7 +934,6 @@ func (f *proxyStreamForwarder) forwardAck(
 
 func (f *proxyStreamForwarder) forwardReplicationMessages(
 	streamTracker *StreamTracker,
-	streamID string,
 	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 	sourceStreamClient adminservice.AdminService_StreamWorkflowReplicationMessagesClient,
 	shutdownChan channel.ShutdownOnce,
@@ -965,7 +956,7 @@ func (f *proxyStreamForwarder) forwardReplicationMessages(
 			return
 		}
 
-		streamTracker.UpdateStream(streamID)
+		streamTracker.UpdateStream(f.streamID)
 
 		switch attr := resp.GetAttributes().(type) {
 		case *adminservice.StreamWorkflowReplicationMessagesResponse_Messages:
@@ -975,7 +966,7 @@ func (f *proxyStreamForwarder) forwardReplicationMessages(
 			}
 			f.logger.Info(fmt.Sprintf("forwarding ReplicationMessages: exclusive %v, tasks: %v", attr.Messages.ExclusiveHighWatermark, strings.Join(msg, ", ")))
 
-			streamTracker.UpdateStreamReplicationMessages(streamID, attr.Messages.ExclusiveHighWatermark)
+			streamTracker.UpdateStreamReplicationMessages(f.streamID, attr.Messages.ExclusiveHighWatermark)
 
 			if err = targetStreamServer.Send(resp); err != nil {
 				if err != io.EOF {
