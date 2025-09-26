@@ -279,12 +279,6 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	// Detect intra-proxy streams early for logging/behavior toggles
 	isIntraProxy := common.IsIntraProxy(targetStreamServer.Context())
 
-	if !isIntraProxy && !s.IsInbound {
-		// Register this shard as handled by this proxy
-		s.shardManager.RegisterShard(clientShardID)
-		defer s.shardManager.UnregisterShard(clientShardID)
-	}
-
 	logger := log.With(s.logger,
 		tag.NewStringTag("client", ClusterShardIDtoString(clientShardID)),
 		tag.NewStringTag("server", ClusterShardIDtoString(serverShardID)),
@@ -299,12 +293,12 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	} else if s.IsInbound {
 		directionLabel = "inbound"
 	}
-	logger.Info("AdminStreamReplicationMessages started.")
+	logger.Info("AdminStreamReplicationMessages started.", tag.NewStringTag("direction", directionLabel), tag.NewBoolTag("isIntraProxy", isIntraProxy))
+	defer logger.Info("AdminStreamReplicationMessages stopped.", tag.NewStringTag("direction", directionLabel), tag.NewBoolTag("isIntraProxy", isIntraProxy))
+
 	streamsActiveGauge := metrics.AdminServiceStreamsActive.WithLabelValues(directionLabel)
 	streamsActiveGauge.Inc()
 	defer streamsActiveGauge.Dec()
-
-	defer logger.Info("AdminStreamReplicationMessages stopped.")
 
 	if cfg := s.Config.ShardCountConfig; cfg.Mode == config.ShardCountLCM {
 		// Abitrary shard count support.
@@ -362,7 +356,8 @@ func (s *adminServiceProxyServer) streamForwarding(
 	serverShardID history.ClusterShardID,
 	directionLabel string,
 ) error {
-	logger.Info("stream forwarding started")
+	logger.Info("streamForwarding started")
+	defer logger.Info("streamForwarding finished")
 
 	outgoingContext := metadata.NewOutgoingContext(targetStreamServer.Context(), targetMetadata)
 	outgoingContext, cancel := context.WithCancel(outgoingContext)
@@ -374,7 +369,7 @@ func (s *adminServiceProxyServer) streamForwarding(
 		return err
 	}
 
-	forwarder := &proxyStreamForwarder{logger: logger}
+	forwarder := &proxyStreamForwarder{logger: logger, cancel: cancel}
 	shutdownChan := channel.NewShutdownOnce()
 	forwarder.Run(
 		directionLabel,
@@ -396,7 +391,8 @@ func (s *adminServiceProxyServer) streamIntraProxyRouting(
 	serverShardID history.ClusterShardID,
 	directionLabel string,
 ) error {
-	logger.Info("intra-proxy routing started")
+	logger.Info("streamIntraProxyRouting started")
+	defer logger.Info("streamIntraProxyRouting finished")
 
 	// Determine remote peer identity from intra-proxy headers
 	peerNodeName := ""
@@ -446,6 +442,8 @@ func (s *adminServiceProxyServer) streamRouting(
 	sourceShardID history.ClusterShardID,
 	directionLabel string,
 ) error {
+	logger.Info("streamRouting started")
+	defer logger.Info("streamRouting stopped")
 
 	// client: stream receiver
 	// server: stream sender

@@ -240,12 +240,12 @@ func (s *proxyStreamSender) Run(
 	s.logger = log.With(s.logger,
 		tag.NewStringTag("role", "sender"),
 	)
+	s.logger.Info("proxyStreamSender Run")
+	defer s.logger.Info("proxyStreamSender Run finished")
 
 	// Register this sender as the owner of the shard for the duration of the stream
-	if s.shardManager != nil {
-		s.shardManager.RegisterShard(s.targetShardID)
-		defer s.shardManager.UnregisterShard(s.targetShardID)
-	}
+	s.shardManager.RegisterShard(s.targetShardID)
+	defer s.shardManager.UnregisterShard(s.targetShardID)
 
 	// Register local stream tracking for sender (short id, include role)
 	s.streamTracker = GetGlobalStreamTracker()
@@ -579,6 +579,8 @@ func (r *proxyStreamReceiver) Run(
 		tag.NewStringTag("stream-target-shard", ClusterShardIDtoString(r.targetShardID)),
 		tag.NewStringTag("role", "receiver"),
 	)
+	r.logger.Info("proxyStreamReceiver Run")
+	defer r.logger.Info("proxyStreamReceiver Run finished")
 
 	// Build metadata for local server stream
 	md := metadata.New(map[string]string{})
@@ -700,21 +702,40 @@ func (r *proxyStreamReceiver) recvReplicationMessages(
 			// If replication tasks are empty, still log the empty batch and send watermark
 			if len(attr.Messages.ReplicationTasks) == 0 {
 				r.logger.Info("Receiver received empty replication batch", tag.NewInt64("exclusive_high", attr.Messages.ExclusiveHighWatermark))
-				for targetShardID, sendChan := range r.proxy.GetRemoteSendChansByCluster(r.targetShardID.ClusterID) {
-					r.logger.Info("Sending high watermark to target shard", tag.NewStringTag("targetShard", ClusterShardIDtoString(targetShardID)), tag.NewInt64("exclusive_high", attr.Messages.ExclusiveHighWatermark))
-					sendChan <- RoutedMessage{
-						SourceShard: r.sourceShardID,
-						Resp: &adminservice.StreamWorkflowReplicationMessagesResponse{
-							Attributes: &adminservice.StreamWorkflowReplicationMessagesResponse_Messages{
-								Messages: &replicationv1.WorkflowReplicationMessages{
-									ExclusiveHighWatermark: attr.Messages.ExclusiveHighWatermark,
-									Priority:               attr.Messages.Priority,
-								},
+				msg := RoutedMessage{
+					SourceShard: r.sourceShardID,
+					Resp: &adminservice.StreamWorkflowReplicationMessagesResponse{
+						Attributes: &adminservice.StreamWorkflowReplicationMessagesResponse_Messages{
+							Messages: &replicationv1.WorkflowReplicationMessages{
+								ExclusiveHighWatermark: attr.Messages.ExclusiveHighWatermark,
+								Priority:               attr.Messages.Priority,
 							},
 						},
+					},
+				}
+				localShardsToSend := r.proxy.GetRemoteSendChansByCluster(r.targetShardID.ClusterID)
+				r.logger.Info("Going to broadcast high watermark to local shards", tag.NewStringTag("localShardsToSend", fmt.Sprintf("%v", localShardsToSend)))
+				for targetShardID, sendChan := range localShardsToSend {
+					r.logger.Info("Sending high watermark to target shard", tag.NewStringTag("targetShard", ClusterShardIDtoString(targetShardID)), tag.NewInt64("exclusive_high", attr.Messages.ExclusiveHighWatermark))
+					sendChan <- msg
+				}
+				// send to all remote shards on other nodes as well
+				remoteShards, err := r.shardManager.GetRemoteShardsForPeer("")
+				if err != nil {
+					r.logger.Error("Failed to get remote shards", tag.Error(err))
+					return err
+				}
+				r.logger.Info("Going to broadcast high watermark to remote shards", tag.NewStringTag("remoteShards", fmt.Sprintf("%v", remoteShards)))
+				for _, shards := range remoteShards {
+					for _, shard := range shards.Shards {
+						if shard.ID.ClusterID != r.targetShardID.ClusterID {
+							continue
+						}
+						if !r.shardManager.DeliverMessagesToShardOwner(shard.ID, &msg, r.proxy, shutdownChan, r.logger) {
+							r.logger.Warn("Failed to send ReplicationTasks to remote shard", tag.NewStringTag("shard", ClusterShardIDtoString(shard.ID)))
+						}
 					}
 				}
-				continue
 			}
 
 			// Retry across the whole target set until all sends succeed (or shutdown)
@@ -835,11 +856,44 @@ func (r *proxyStreamReceiver) sendAck(
 	return nil
 }
 
+type StreamRequestOrResponse interface {
+	adminservice.StreamWorkflowReplicationMessagesRequest | adminservice.StreamWorkflowReplicationMessagesResponse
+}
+type ValueWithError[T StreamRequestOrResponse] struct {
+	val *T
+	err error
+}
+type recvable[T StreamRequestOrResponse] interface {
+	Recv() (*T, error)
+}
+
+// startListener creates a channel of Recv() from the provided source. It is the job of the caller to cancel the context
+// that will stop Recv(), or the goroutine created by this will block forever
+func startListener[T StreamRequestOrResponse](
+	receiver recvable[T],
+	shutdownChan channel.ShutdownOnce,
+) chan ValueWithError[T] {
+	targetStreamServerData := make(chan ValueWithError[T])
+	go func() {
+		defer close(targetStreamServerData)
+		for !shutdownChan.IsShutdown() {
+			req, err := receiver.Recv()
+			select {
+			case targetStreamServerData <- ValueWithError[T]{val: req, err: err}:
+			case <-shutdownChan.Channel():
+				return
+			}
+		}
+	}()
+	return targetStreamServerData
+}
+
 // proxyStreamForwarder forwards between a downstream server stream and an upstream
 // client stream. It is used when the proxy acts as a pure pass-through.
 type proxyStreamForwarder struct {
 	logger   log.Logger
 	streamID string
+	cancel   context.CancelFunc
 }
 
 func (f *proxyStreamForwarder) Run(
@@ -880,23 +934,46 @@ func (f *proxyStreamForwarder) forwardAck(
 	shutdownChan channel.ShutdownOnce,
 	wg *sync.WaitGroup,
 ) {
-	// Mark role as forwarder for this stream
 	defer func() {
-		f.logger.Info("Shutdown targetStreamServer.Recv loop.")
+		f.logger.Debug("Shutdown targetStreamServer.Recv loop.")
 		shutdownChan.Shutdown()
-		err := sourceStreamClient.CloseSend()
+		var err error
+		closeSent := make(chan struct{})
+		go func() {
+			err = sourceStreamClient.CloseSend()
+			closeSent <- struct{}{}
+		}()
+		timeout := time.After(time.Second)
+		select {
+		case <-closeSent:
+			break
+		case <-timeout:
+			err = fmt.Errorf("timed out waiting for source stream to close")
+		}
+
 		if err != nil {
 			f.logger.Error("Failed to close sourceStreamClient", tag.Error(err))
 		}
 		wg.Done()
 	}()
 
-	for !shutdownChan.IsShutdown() {
-		req, err := targetStreamServer.Recv()
+	dataChan := startListener(targetStreamServer, shutdownChan)
+
+	for {
+		var req *adminservice.StreamWorkflowReplicationMessagesRequest
+		var err error
+		select {
+		case <-shutdownChan.Channel():
+			return
+		case valueWithError := <-dataChan:
+			req = valueWithError.val
+			err = valueWithError.err
+		}
 		if err == io.EOF {
 			f.logger.Info("targetStreamServer.Recv encountered EOF", tag.Error(err))
 			return
 		}
+
 		if err != nil {
 			f.logger.Error("targetStreamServer.Recv encountered error", tag.Error(err))
 			return
@@ -945,12 +1022,22 @@ func (f *proxyStreamForwarder) forwardReplicationMessages(
 		wg.Done()
 	}()
 
-	for !shutdownChan.IsShutdown() {
-		resp, err := sourceStreamClient.Recv()
+	dataChan := startListener(sourceStreamClient, shutdownChan)
+	for {
+		var resp *adminservice.StreamWorkflowReplicationMessagesResponse
+		var err error
+		select {
+		case <-shutdownChan.Channel():
+			return
+		case dataWithError := <-dataChan:
+			resp = dataWithError.val
+			err = dataWithError.err
+		}
 		if err == io.EOF {
 			f.logger.Info("sourceStreamClient.Recv encountered EOF", tag.Error(err))
 			return
 		}
+
 		if err != nil {
 			f.logger.Error("sourceStreamClient.Recv encountered error", tag.Error(err))
 			return

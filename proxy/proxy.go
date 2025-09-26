@@ -305,36 +305,42 @@ func NewProxy(
 		localReceiverCancelFuncs: make(map[history.ClusterShardID]context.CancelFunc),
 	}
 
-	// Initialize intra-proxy manager for peer communication
-	proxy.intraMgr = newIntraProxyManager(logger)
+	if s2sConfig.ShardCountConfig.Mode == config.ShardCountRouting {
+		// Initialize intra-proxy manager for peer communication
+		proxy.intraMgr = newIntraProxyManager(logger, proxy)
 
-	// Wire memberlist peer-join callback to reconcile intra-proxy receivers for local/remote pairs
-	shardManager.SetOnPeerJoin(func(nodeName string) {
-		logger.Info("OnPeerJoin", tag.NewStringTag("nodeName", nodeName))
-		defer logger.Info("OnPeerJoin done", tag.NewStringTag("nodeName", nodeName))
-		proxy.intraMgr.ReconcilePeerStreams(proxy, nodeName)
-	})
+		// Wire memberlist peer-join callback to reconcile intra-proxy receivers for local/remote pairs
+		shardManager.SetOnPeerJoin(func(nodeName string) {
+			logger.Info("OnPeerJoin", tag.NewStringTag("nodeName", nodeName))
+			defer logger.Info("OnPeerJoin done", tag.NewStringTag("nodeName", nodeName))
+			proxy.intraMgr.Notify()
+			// proxy.intraMgr.ReconcilePeerStreams(proxy, nodeName)
+		})
 
-	// Wire peer-leave to cleanup intra-proxy resources for that peer
-	shardManager.SetOnPeerLeave(func(nodeName string) {
-		logger.Info("OnPeerLeave", tag.NewStringTag("nodeName", nodeName))
-		defer logger.Info("OnPeerLeave done", tag.NewStringTag("nodeName", nodeName))
-		proxy.intraMgr.ReconcilePeerStreams(proxy, nodeName)
-	})
+		// Wire peer-leave to cleanup intra-proxy resources for that peer
+		shardManager.SetOnPeerLeave(func(nodeName string) {
+			logger.Info("OnPeerLeave", tag.NewStringTag("nodeName", nodeName))
+			defer logger.Info("OnPeerLeave done", tag.NewStringTag("nodeName", nodeName))
+			proxy.intraMgr.Notify()
+			// proxy.intraMgr.ReconcilePeerStreams(proxy, nodeName)
+		})
 
-	// Wire local shard changes to reconcile intra-proxy receivers
-	shardManager.SetOnLocalShardChange(func(shard history.ClusterShardID, added bool) {
-		logger.Info("OnLocalShardChange", tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
-		defer logger.Info("OnLocalShardChange done", tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
-		proxy.intraMgr.ReconcilePeerStreams(proxy, "")
-	})
+		// Wire local shard changes to reconcile intra-proxy receivers
+		shardManager.SetOnLocalShardChange(func(shard history.ClusterShardID, added bool) {
+			logger.Info("OnLocalShardChange", tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
+			defer logger.Info("OnLocalShardChange done", tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
+			proxy.intraMgr.Notify()
+			// proxy.intraMgr.ReconcilePeerStreams(proxy, "")
+		})
 
-	// Wire remote shard changes to reconcile intra-proxy receivers
-	shardManager.SetOnRemoteShardChange(func(peer string, shard history.ClusterShardID, added bool) {
-		logger.Info("OnRemoteShardChange", tag.NewStringTag("peer", peer), tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
-		defer logger.Info("OnRemoteShardChange done", tag.NewStringTag("peer", peer), tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
-		proxy.intraMgr.ReconcilePeerStreams(proxy, peer)
-	})
+		// Wire remote shard changes to reconcile intra-proxy receivers
+		shardManager.SetOnRemoteShardChange(func(peer string, shard history.ClusterShardID, added bool) {
+			logger.Info("OnRemoteShardChange", tag.NewStringTag("peer", peer), tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
+			defer logger.Info("OnRemoteShardChange done", tag.NewStringTag("peer", peer), tag.NewStringTag("shard", ClusterShardIDtoString(shard)), tag.NewStringTag("added", strconv.FormatBool(added)))
+			proxy.intraMgr.Notify()
+			// proxy.intraMgr.ReconcilePeerStreams(proxy, peer)
+		})
+	}
 
 	// Proxy consists of two grpc servers: inbound and outbound. The flow looks like the following:
 	//    local server -> proxy(outbound) -> remote server
@@ -440,6 +446,12 @@ func (s *Proxy) Start() error {
 
 	if err := s.shardManager.Start(); err != nil {
 		return err
+	}
+
+	if s.intraMgr != nil {
+		if err := s.intraMgr.Start(); err != nil {
+			return err
+		}
 	}
 
 	if err := s.transManager.Start(); err != nil {

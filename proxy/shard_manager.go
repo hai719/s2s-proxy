@@ -252,6 +252,7 @@ func (sm *shardManagerImpl) Stop() {
 }
 
 func (sm *shardManagerImpl) RegisterShard(clientShardID history.ClusterShardID) {
+	sm.logger.Info("RegisterShard", tag.NewStringTag("shard", ClusterShardIDtoString(clientShardID)))
 	sm.addLocalShard(clientShardID)
 	// record locally with created timestamp
 	sm.mutex.Lock()
@@ -273,6 +274,7 @@ func (sm *shardManagerImpl) RegisterShard(clientShardID history.ClusterShardID) 
 }
 
 func (sm *shardManagerImpl) UnregisterShard(clientShardID history.ClusterShardID) {
+	sm.logger.Info("UnregisterShard", tag.NewStringTag("shard", ClusterShardIDtoString(clientShardID)))
 	sm.removeLocalShard(clientShardID)
 	sm.mutex.Lock()
 	delete(sm.localShards, ClusterShardIDtoShortString(clientShardID))

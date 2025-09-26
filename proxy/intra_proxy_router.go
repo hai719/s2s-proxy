@@ -29,6 +29,8 @@ import (
 type intraProxyManager struct {
 	logger    log.Logger
 	streamsMu sync.RWMutex
+	proxy     *Proxy
+	notifyCh  chan struct{}
 	// Group state by remote peer for unified lifecycle ops
 	peers map[string]*peerState
 }
@@ -41,14 +43,16 @@ type peerState struct {
 }
 
 type peerStreamKey struct {
-	clientShard history.ClusterShardID
-	serverShard history.ClusterShardID
+	targetShard history.ClusterShardID
+	sourceShard history.ClusterShardID
 }
 
-func newIntraProxyManager(logger log.Logger) *intraProxyManager {
+func newIntraProxyManager(logger log.Logger, proxy *Proxy) *intraProxyManager {
 	return &intraProxyManager{
-		logger: logger,
-		peers:  make(map[string]*peerState),
+		logger:   logger,
+		proxy:    proxy,
+		peers:    make(map[string]*peerState),
+		notifyCh: make(chan struct{}),
 	}
 }
 
@@ -172,7 +176,7 @@ type intraProxyStreamReceiver struct {
 }
 
 // Run opens the client stream with metadata, registers tracking, and starts receiver goroutines.
-func (r *intraProxyStreamReceiver) Run(ctx context.Context, self *Proxy, conn *grpc.ClientConn) error {
+func (r *intraProxyStreamReceiver) Run(ctx context.Context, p *Proxy, conn *grpc.ClientConn) error {
 	r.logger.Info("intraProxyStreamReceiver Run")
 	// Build metadata according to receiver pattern: client=targetShard, server=sourceShard
 	md := metadata.New(map[string]string{})
@@ -182,7 +186,7 @@ func (r *intraProxyStreamReceiver) Run(ctx context.Context, self *Proxy, conn *g
 	md.Set(history.MetadataKeyServerShardID, fmt.Sprintf("%d", r.sourceShardID.ShardID))
 	ctx = metadata.NewOutgoingContext(ctx, md)
 	ctx = common.WithIntraProxyHeaders(ctx, map[string]string{
-		common.IntraProxyOriginProxyIDHeader: self.shardManager.GetShardInfo().NodeName,
+		common.IntraProxyOriginProxyIDHeader: p.shardManager.GetShardInfo().NodeName,
 	})
 
 	// Ensure we can cancel Recv() by canceling the context when tearing down
@@ -200,14 +204,14 @@ func (r *intraProxyStreamReceiver) Run(ctx context.Context, self *Proxy, conn *g
 	r.streamClient = stream
 
 	// Register client-side intra-proxy stream in tracker
-	r.streamID = BuildIntraProxyReceiverStreamID(r.peerNodeName, r.targetShardID, r.sourceShardID)
+	r.streamID = BuildIntraProxyReceiverStreamID(r.peerNodeName, r.sourceShardID, r.targetShardID)
 	r.logger = log.With(r.logger, tag.NewStringTag("streamID", r.streamID))
 	st := GetGlobalStreamTracker()
 	st.RegisterStream(r.streamID, "StreamWorkflowReplicationMessages", "intra-proxy", ClusterShardIDtoString(r.targetShardID), ClusterShardIDtoString(r.sourceShardID), StreamRoleForwarder)
 	defer st.UnregisterStream(r.streamID)
 
 	// Start replication receiver loop
-	return r.recvReplicationMessages(self)
+	return r.recvReplicationMessages(p)
 }
 
 // recvReplicationMessages receives replication messages and forwards to local shard owner.
@@ -294,7 +298,7 @@ func (m *intraProxyManager) RegisterSender(
 	if clientShard.ClusterID == serverShard.ClusterID {
 		return
 	}
-	key := peerStreamKey{clientShard: clientShard, serverShard: serverShard}
+	key := peerStreamKey{targetShard: clientShard, sourceShard: serverShard}
 	m.streamsMu.Lock()
 	ps := m.peers[peerNodeName]
 	if ps == nil {
@@ -313,7 +317,7 @@ func (m *intraProxyManager) UnregisterSender(
 	clientShard history.ClusterShardID,
 	serverShard history.ClusterShardID,
 ) {
-	key := peerStreamKey{clientShard: clientShard, serverShard: serverShard}
+	key := peerStreamKey{targetShard: clientShard, sourceShard: serverShard}
 	m.streamsMu.Lock()
 	if ps := m.peers[peerNodeName]; ps != nil && ps.senders != nil {
 		delete(ps.senders, key)
@@ -322,15 +326,15 @@ func (m *intraProxyManager) UnregisterSender(
 }
 
 // EnsureReceiverForPeerShard ensures a client stream and an ACK aggregator exist for the given peer/shard pair.
-func (m *intraProxyManager) EnsureReceiverForPeerShard(p *Proxy, peerNodeName string, clientShard history.ClusterShardID, serverShard history.ClusterShardID) {
+func (m *intraProxyManager) EnsureReceiverForPeerShard(p *Proxy, peerNodeName string, targetShard history.ClusterShardID, sourceShard history.ClusterShardID) {
 	logger := log.With(m.logger,
 		tag.NewStringTag("peerNodeName", peerNodeName),
-		tag.NewStringTag("clientShard", ClusterShardIDtoString(clientShard)),
-		tag.NewStringTag("serverShard", ClusterShardIDtoString(serverShard)))
+		tag.NewStringTag("targetShard", ClusterShardIDtoString(targetShard)),
+		tag.NewStringTag("sourceShard", ClusterShardIDtoString(sourceShard)))
 	logger.Info("EnsureReceiverForPeerShard")
 
 	// Cross-cluster only
-	if clientShard.ClusterID == serverShard.ClusterID {
+	if targetShard.ClusterID == sourceShard.ClusterID {
 		return
 	}
 	// Do not create intra-proxy streams to self instance
@@ -338,11 +342,11 @@ func (m *intraProxyManager) EnsureReceiverForPeerShard(p *Proxy, peerNodeName st
 		return
 	}
 	// Require at least one shard to be local to this instance
-	if !p.shardManager.IsLocalShard(clientShard) && !p.shardManager.IsLocalShard(serverShard) {
+	if !p.shardManager.IsLocalShard(targetShard) && !p.shardManager.IsLocalShard(sourceShard) {
 		return
 	}
 	// Consolidated path: ensure stream and background loops
-	err := m.ensureStream(context.Background(), logger, peerNodeName, clientShard, serverShard, p)
+	err := m.ensureStream(context.Background(), logger, peerNodeName, targetShard, sourceShard, p)
 	if err != nil {
 		logger.Error("failed to ensureStream", tag.Error(err))
 	}
@@ -426,12 +430,12 @@ func (m *intraProxyManager) ensureStream(
 	ctx context.Context,
 	logger log.Logger,
 	peerNodeName string,
-	clientShard history.ClusterShardID,
-	serverShard history.ClusterShardID,
+	targetShard history.ClusterShardID,
+	sourceShard history.ClusterShardID,
 	p *Proxy,
 ) error {
 	logger.Info("ensureStream")
-	key := peerStreamKey{clientShard: clientShard, serverShard: serverShard}
+	key := peerStreamKey{targetShard: targetShard, sourceShard: sourceShard}
 
 	// Fast path: already exists
 	m.streamsMu.RLock()
@@ -455,14 +459,14 @@ func (m *intraProxyManager) ensureStream(
 	recv := &intraProxyStreamReceiver{
 		logger: log.With(m.logger,
 			tag.NewStringTag("peerNodeName", peerNodeName),
-			tag.NewStringTag("targetShardID", ClusterShardIDtoString(clientShard)),
-			tag.NewStringTag("sourceShardID", ClusterShardIDtoString(serverShard))),
+			tag.NewStringTag("targetShardID", ClusterShardIDtoString(targetShard)),
+			tag.NewStringTag("sourceShardID", ClusterShardIDtoString(sourceShard))),
 		shardManager:  p.shardManager,
 		proxy:         p,
 		intraMgr:      m,
 		peerNodeName:  peerNodeName,
-		targetShardID: clientShard,
-		sourceShardID: serverShard,
+		targetShardID: targetShard,
+		sourceShardID: sourceShard,
 	}
 	// initialize shutdown handle and register it for lifecycle management
 	recv.shutdown = channel.NewShutdownOnce()
@@ -485,7 +489,7 @@ func (m *intraProxyManager) sendAck(
 	p *Proxy,
 	req *adminservice.StreamWorkflowReplicationMessagesRequest,
 ) error {
-	key := peerStreamKey{clientShard: clientShard, serverShard: serverShard}
+	key := peerStreamKey{targetShard: clientShard, sourceShard: serverShard}
 	m.streamsMu.RLock()
 	defer m.streamsMu.RUnlock()
 	if ps, ok := m.peers[peerNodeName]; ok && ps != nil {
@@ -506,10 +510,10 @@ func (m *intraProxyManager) sendReplicationMessages(
 	peerNodeName string,
 	clientShard history.ClusterShardID,
 	serverShard history.ClusterShardID,
-	self *Proxy,
+	p *Proxy,
 	resp *adminservice.StreamWorkflowReplicationMessagesResponse,
 ) error {
-	key := peerStreamKey{clientShard: clientShard, serverShard: serverShard}
+	key := peerStreamKey{targetShard: clientShard, sourceShard: serverShard}
 
 	// Try server stream first with short retry/backoff to await registration
 	deadline := time.Now().Add(2 * time.Second)
@@ -553,7 +557,7 @@ func (m *intraProxyManager) closePeerLocked(peer string, ps *peerState) {
 			shut.Shutdown()
 		}
 		st := GetGlobalStreamTracker()
-		cliID := BuildIntraProxyReceiverStreamID(peer, key.clientShard, key.serverShard)
+		cliID := BuildIntraProxyReceiverStreamID(peer, key.targetShard, key.sourceShard)
 		st.UnregisterStream(cliID)
 		delete(ps.recvShutdown, key)
 	}
@@ -564,7 +568,7 @@ func (m *intraProxyManager) closePeerLocked(peer string, ps *peerState) {
 	// Unregister server-side tracker entries
 	for key := range ps.senders {
 		st := GetGlobalStreamTracker()
-		srvID := BuildIntraProxySenderStreamID(peer, key.clientShard, key.serverShard)
+		srvID := BuildIntraProxySenderStreamID(peer, key.targetShard, key.sourceShard)
 		st.UnregisterStream(srvID)
 		delete(ps.senders, key)
 	}
@@ -577,11 +581,11 @@ func (m *intraProxyManager) closePeerLocked(peer string, ps *peerState) {
 
 // closePeerShardLocked shuts down and removes resources for a specific peer/shard pair. Caller must hold m.streamsMu.
 func (m *intraProxyManager) closePeerShardLocked(peer string, ps *peerState, key peerStreamKey) {
-	m.logger.Info("closePeerShardLocked", tag.NewStringTag("peer", peer), tag.NewStringTag("clientShard", ClusterShardIDtoString(key.clientShard)), tag.NewStringTag("serverShard", ClusterShardIDtoString(key.serverShard)))
+	m.logger.Info("closePeerShardLocked", tag.NewStringTag("peer", peer), tag.NewStringTag("clientShard", ClusterShardIDtoString(key.targetShard)), tag.NewStringTag("serverShard", ClusterShardIDtoString(key.sourceShard)))
 	if shut, ok := ps.recvShutdown[key]; ok && shut != nil {
 		shut.Shutdown()
 		st := GetGlobalStreamTracker()
-		cliID := BuildIntraProxyReceiverStreamID(peer, key.clientShard, key.serverShard)
+		cliID := BuildIntraProxyReceiverStreamID(peer, key.targetShard, key.sourceShard)
 		st.UnregisterStream(cliID)
 		delete(ps.recvShutdown, key)
 	}
@@ -596,7 +600,7 @@ func (m *intraProxyManager) closePeerShardLocked(peer string, ps *peerState, key
 		delete(ps.receivers, key)
 	}
 	st := GetGlobalStreamTracker()
-	srvID := BuildIntraProxySenderStreamID(peer, key.clientShard, key.serverShard)
+	srvID := BuildIntraProxySenderStreamID(peer, key.targetShard, key.sourceShard)
 	st.UnregisterStream(srvID)
 	delete(ps.senders, key)
 }
@@ -612,7 +616,7 @@ func (m *intraProxyManager) ClosePeer(peer string) {
 
 // ClosePeerShard closes resources for a specific peer/shard pair.
 func (m *intraProxyManager) ClosePeerShard(peer string, clientShard, serverShard history.ClusterShardID) {
-	key := peerStreamKey{clientShard: clientShard, serverShard: serverShard}
+	key := peerStreamKey{targetShard: clientShard, sourceShard: serverShard}
 	m.streamsMu.Lock()
 	defer m.streamsMu.Unlock()
 	if ps, ok := m.peers[peer]; ok {
@@ -629,14 +633,14 @@ func (m *intraProxyManager) CloseShardAcrossPeers(shard history.ClusterShardID) 
 		// Collect keys to avoid mutating map during iteration
 		toClose := make([]peerStreamKey, 0)
 		for key := range ps.receivers {
-			if (key.clientShard.ClusterID == shard.ClusterID && key.clientShard.ShardID == shard.ShardID) ||
-				(key.serverShard.ClusterID == shard.ClusterID && key.serverShard.ShardID == shard.ShardID) {
+			if (key.targetShard.ClusterID == shard.ClusterID && key.targetShard.ShardID == shard.ShardID) ||
+				(key.sourceShard.ClusterID == shard.ClusterID && key.sourceShard.ShardID == shard.ShardID) {
 				toClose = append(toClose, key)
 			}
 		}
 		for key := range ps.senders {
-			if (key.clientShard.ClusterID == shard.ClusterID && key.clientShard.ShardID == shard.ShardID) ||
-				(key.serverShard.ClusterID == shard.ClusterID && key.serverShard.ShardID == shard.ShardID) {
+			if (key.targetShard.ClusterID == shard.ClusterID && key.targetShard.ShardID == shard.ShardID) ||
+				(key.sourceShard.ClusterID == shard.ClusterID && key.sourceShard.ShardID == shard.ShardID) {
 				// ensure key is present in toClose for unified cleanup
 				toClose = append(toClose, key)
 			}
@@ -647,6 +651,29 @@ func (m *intraProxyManager) CloseShardAcrossPeers(shard history.ClusterShardID) 
 	}
 }
 
+func (m *intraProxyManager) Start() error {
+	go func() {
+		for {
+			// timer
+			timer := time.NewTimer(1 * time.Second)
+			select {
+			case <-timer.C:
+				m.ReconcilePeerStreams(m.proxy, "")
+			case <-m.notifyCh:
+				m.ReconcilePeerStreams(m.proxy, "")
+			}
+		}
+	}()
+	return nil
+}
+
+func (m *intraProxyManager) Notify() {
+	select {
+	case m.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
 // ReconcilePeerStreams ensures receivers exist for desired (local shard, remote shard) pairs
 // for a given peer and closes any sender/receiver not in the desired set.
 // This mirrors the Temporal StreamReceiverMonitor approach.
@@ -654,72 +681,69 @@ func (m *intraProxyManager) ReconcilePeerStreams(
 	p *Proxy,
 	peerNodeName string,
 ) {
-	f := func() {
-		m.logger.Info("ReconcilePeerStreams", tag.NewStringTag("peerNodeName", peerNodeName))
-		defer m.logger.Info("ReconcilePeerStreams done", tag.NewStringTag("peerNodeName", peerNodeName))
+	m.logger.Info("ReconcilePeerStreams", tag.NewStringTag("peerNodeName", peerNodeName))
+	defer m.logger.Info("ReconcilePeerStreams done", tag.NewStringTag("peerNodeName", peerNodeName))
 
-		if mode := p.config.ShardCountConfig.Mode; mode != config.ShardCountRouting {
-			return
-		}
-		localShards := p.shardManager.GetLocalShards()
-		remoteShards, err := p.shardManager.GetRemoteShardsForPeer(peerNodeName)
-		if err != nil {
-			m.logger.Error("Failed to get remote shards for peer", tag.Error(err))
-			return
-		}
-		m.logger.Info("ReconcilePeerStreams",
-			tag.NewStringTag("peerNodeName", peerNodeName),
-			tag.NewStringTag("remoteShards", fmt.Sprintf("%v", remoteShards)),
-			tag.NewStringTag("localShards", fmt.Sprintf("%v", localShards)),
-		)
-
-		// Build desired set of cross-cluster pairs
-		desired := make(map[peerStreamKey]string)
-		for _, l := range localShards {
-			for peer, shards := range remoteShards {
-				for _, r := range shards.Shards {
-					if l.ClusterID == r.ID.ClusterID {
-						continue
-					}
-					desired[peerStreamKey{clientShard: l, serverShard: r.ID}] = peer
-				}
-			}
-		}
-
-		m.logger.Info("ReconcilePeerStreams", tag.NewStringTag("desired", fmt.Sprintf("%v", desired)))
-
-		// Ensure all desired receivers exist
-		for key := range desired {
-			m.EnsureReceiverForPeerShard(p, desired[key], key.clientShard, key.serverShard)
-		}
-
-		// Prune anything not desired
-		check := func(ps *peerState) {
-			// Collect keys to close for receivers
-			for key := range ps.receivers {
-				if _, ok2 := desired[key]; !ok2 {
-					m.closePeerShardLocked(peerNodeName, ps, key)
-				}
-			}
-			// And for server-side senders, if they don't belong to desired pairs
-			for key := range ps.senders {
-				if _, ok2 := desired[key]; !ok2 {
-					m.closePeerShardLocked(peerNodeName, ps, key)
-				}
-			}
-		}
-
-		m.streamsMu.Lock()
-		if peerNodeName != "" {
-			if ps, ok := m.peers[peerNodeName]; ok && ps != nil {
-				check(ps)
-			}
-		} else {
-			for _, ps := range m.peers {
-				check(ps)
-			}
-		}
-		m.streamsMu.Unlock()
+	if mode := p.config.ShardCountConfig.Mode; mode != config.ShardCountRouting {
+		return
 	}
-	go f()
+	localShards := p.shardManager.GetLocalShards()
+	remoteShards, err := p.shardManager.GetRemoteShardsForPeer(peerNodeName)
+	if err != nil {
+		m.logger.Error("Failed to get remote shards for peer", tag.Error(err))
+		return
+	}
+	m.logger.Info("ReconcilePeerStreams",
+		tag.NewStringTag("peerNodeName", peerNodeName),
+		tag.NewStringTag("remoteShards", fmt.Sprintf("%v", remoteShards)),
+		tag.NewStringTag("localShards", fmt.Sprintf("%v", localShards)),
+	)
+
+	// Build desiredReceivers receiver set of cross-cluster pairs
+	desiredReceivers := make(map[peerStreamKey]string)
+	for _, l := range localShards {
+		for peer, shards := range remoteShards {
+			for _, r := range shards.Shards {
+				if l.ClusterID == r.ID.ClusterID {
+					continue
+				}
+				desiredReceivers[peerStreamKey{targetShard: l, sourceShard: r.ID}] = peer
+			}
+		}
+	}
+
+	m.logger.Info("ReconcilePeerStreams", tag.NewStringTag("desiredReceivers", fmt.Sprintf("%v", desiredReceivers)))
+
+	// Ensure all desired receivers exist
+	for key := range desiredReceivers {
+		m.EnsureReceiverForPeerShard(p, desiredReceivers[key], key.targetShard, key.sourceShard)
+	}
+
+	// Prune anything not desired
+	check := func(ps *peerState) {
+		// Collect keys to close for receivers
+		for key := range ps.receivers {
+			if _, ok2 := desiredReceivers[key]; !ok2 {
+				m.closePeerShardLocked(peerNodeName, ps, key)
+			}
+		}
+		// And for server-side senders, if they don't belong to desired pairs
+		for key := range ps.senders {
+			if _, ok2 := desiredReceivers[key]; !ok2 {
+				m.closePeerShardLocked(peerNodeName, ps, key)
+			}
+		}
+	}
+
+	m.streamsMu.Lock()
+	if peerNodeName != "" {
+		if ps, ok := m.peers[peerNodeName]; ok && ps != nil {
+			check(ps)
+		}
+	} else {
+		for _, ps := range m.peers {
+			check(ps)
+		}
+	}
+	m.streamsMu.Unlock()
 }
