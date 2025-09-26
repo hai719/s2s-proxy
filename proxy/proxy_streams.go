@@ -593,6 +593,8 @@ func (r *proxyStreamReceiver) Run(
 	outgoingContext, cancel := context.WithCancel(outgoingContext)
 	defer cancel()
 
+	r.logger.Info("proxyStreamReceiver outgoingContext created")
+
 	// Open stream receiver -> local server's stream sender for clientShardID
 	var sourceStreamClient adminservice.AdminService_StreamWorkflowReplicationMessagesClient
 	var err error
@@ -605,6 +607,8 @@ func (r *proxyStreamReceiver) Run(
 		r.logger.Error("inboundServer.StreamWorkflowReplicationMessages error", tag.Error(err))
 		return
 	}
+
+	r.logger.Info("proxyStreamReceiver sourceStreamClient created")
 
 	// Setup ack channel and cancel func bookkeeping
 	r.ackChan = make(chan RoutedAck, 100)
@@ -736,6 +740,7 @@ func (r *proxyStreamReceiver) recvReplicationMessages(
 						}
 					}
 				}
+				continue
 			}
 
 			// Retry across the whole target set until all sends succeed (or shutdown)
@@ -744,6 +749,7 @@ func (r *proxyStreamReceiver) recvReplicationMessages(
 			for targetShardID := range tasksByTargetShard {
 				sentByTarget[targetShardID] = false
 			}
+			r.logger.Info("Going to broadcast ReplicationTasks to target shards", tag.NewStringTag("tasksByTargetShard", fmt.Sprintf("%v", tasksByTargetShard)))
 			numRemaining := len(tasksByTargetShard)
 			backoff := 10 * time.Millisecond
 			for numRemaining > 0 {
@@ -775,7 +781,7 @@ func (r *proxyStreamReceiver) recvReplicationMessages(
 						progress = true
 					} else {
 						if !loggedByTarget[targetShardID] {
-							r.logger.Warn("No send channel found for target shard; retrying until available", tag.NewStringTag("targetShard", ClusterShardIDtoString(targetShardID)))
+							r.logger.Warn("No send channel found for target shard; retrying until available", tag.NewStringTag("task-target-shard", ClusterShardIDtoString(targetShardID)))
 							loggedByTarget[targetShardID] = true
 						}
 					}
