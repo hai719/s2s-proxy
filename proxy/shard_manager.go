@@ -25,10 +25,10 @@ type (
 		Start() error
 		// Stop shuts down the manager and leaves the cluster
 		Stop()
-		// RegisterShard registers a clientShardID as owned by this proxy instance
-		RegisterShard(clientShardID history.ClusterShardID)
-		// UnregisterShard removes a clientShardID from this proxy's ownership
-		UnregisterShard(clientShardID history.ClusterShardID)
+		// RegisterShard registers a clientShardID as owned by this proxy instance and returns the registration timestamp
+		RegisterShard(clientShardID history.ClusterShardID) time.Time
+		// UnregisterShard removes a clientShardID from this proxy's ownership only if the timestamp matches
+		UnregisterShard(clientShardID history.ClusterShardID, expectedRegisteredAt time.Time)
 		// GetProxyAddress returns the proxy service address for the given node name
 		GetProxyAddress(nodeName string) (string, bool)
 		// IsLocalShard checks if this proxy instance owns the given shard
@@ -295,9 +295,9 @@ func (sm *shardManagerImpl) Stop() {
 	sm.logger.Info("Shard manager stopped")
 }
 
-func (sm *shardManagerImpl) RegisterShard(clientShardID history.ClusterShardID) {
+func (sm *shardManagerImpl) RegisterShard(clientShardID history.ClusterShardID) time.Time {
 	sm.logger.Info("RegisterShard", tag.NewStringTag("shard", ClusterShardIDtoString(clientShardID)))
-	sm.addLocalShard(clientShardID)
+	registeredAt := sm.addLocalShard(clientShardID)
 	// record locally with created timestamp
 	sm.mutex.Lock()
 	// Update metrics after local shards change
@@ -315,27 +315,38 @@ func (sm *shardManagerImpl) RegisterShard(clientShardID history.ClusterShardID) 
 	if sm.onLocalShardChange != nil {
 		sm.onLocalShardChange(clientShardID, true)
 	}
+	return registeredAt
 }
 
-func (sm *shardManagerImpl) UnregisterShard(clientShardID history.ClusterShardID) {
+func (sm *shardManagerImpl) UnregisterShard(clientShardID history.ClusterShardID, expectedRegisteredAt time.Time) {
 	sm.logger.Info("UnregisterShard", tag.NewStringTag("shard", ClusterShardIDtoString(clientShardID)))
-	sm.removeLocalShard(clientShardID)
-	sm.mutex.Lock()
-	delete(sm.localShards, ClusterShardIDtoShortString(clientShardID))
-	// Update metrics after local shards change
-	metrics.ShardDistributionGauge.WithLabelValues(sm.config.NodeName).Set(float64(len(sm.localShards)))
-	sm.mutex.Unlock()
-	sm.broadcastShardChange("unregister", clientShardID)
 
-	// Trigger memberlist metadata update to propagate NodeMeta to other nodes
-	if sm.ml != nil {
-		if err := sm.ml.UpdateNode(0); err != nil { // 0 timeout means immediate update
-			sm.logger.Warn("Failed to update memberlist node metadata", tag.Error(err))
+	// Only unregister if the registration timestamp matches (prevents old senders from removing new registrations)
+	sm.mutex.Lock()
+	key := ClusterShardIDtoShortString(clientShardID)
+	if shardInfo, exists := sm.localShards[key]; exists && shardInfo.Created.Equal(expectedRegisteredAt) {
+		delete(sm.localShards, key)
+		// Update metrics after local shards change
+		metrics.ShardDistributionGauge.WithLabelValues(sm.config.NodeName).Set(float64(len(sm.localShards)))
+		sm.mutex.Unlock()
+
+		sm.removeLocalShard(clientShardID)
+		sm.broadcastShardChange("unregister", clientShardID)
+
+		// Trigger memberlist metadata update to propagate NodeMeta to other nodes
+		if sm.ml != nil {
+			if err := sm.ml.UpdateNode(0); err != nil { // 0 timeout means immediate update
+				sm.logger.Warn("Failed to update memberlist node metadata", tag.Error(err))
+			}
 		}
-	}
-	// Notify listeners
-	if sm.onLocalShardChange != nil {
-		sm.onLocalShardChange(clientShardID, false)
+		// Notify listeners
+		if sm.onLocalShardChange != nil {
+			sm.onLocalShardChange(clientShardID, false)
+		}
+		sm.logger.Info("UnregisterShard completed", tag.NewStringTag("shard", ClusterShardIDtoString(clientShardID)))
+	} else {
+		sm.mutex.Unlock()
+		sm.logger.Info("Skipped unregistering shard (timestamp mismatch or already unregistered)", tag.NewStringTag("shard", ClusterShardIDtoString(clientShardID)))
 	}
 }
 
@@ -506,14 +517,28 @@ func (sm *shardManagerImpl) DeliverAckToShardOwner(
 ) bool {
 	logger = log.With(logger, tag.NewStringTag("sourceShard", ClusterShardIDtoString(sourceShard)), tag.NewInt64("ack", ack))
 	if ackCh, ok := proxy.GetLocalAckChan(sourceShard); ok {
-		select {
-		case ackCh <- *routedAck:
-			if sm.config != nil {
-				metrics.ShardForwardingCounter.WithLabelValues(sm.config.NodeName, sm.config.NodeName, "local_ack").Inc()
+		delivered := false
+		func() {
+			defer func() {
+				if panicErr := recover(); panicErr != nil {
+					logger.Warn("Failed to deliver ACK to local shard owner (channel closed)")
+				}
+			}()
+			select {
+			case ackCh <- *routedAck:
+				if sm.config != nil {
+					metrics.ShardForwardingCounter.WithLabelValues(sm.config.NodeName, sm.config.NodeName, "local_ack").Inc()
+				}
+				logger.Info("Delivered ACK to local shard owner")
+				delivered = true
+			case <-shutdownChan.Channel():
+				// Shutdown signal received
 			}
-			logger.Info("Delivered ACK to local shard owner")
+		}()
+		if delivered {
 			return true
-		case <-shutdownChan.Channel():
+		}
+		if shutdownChan.IsShutdown() {
 			return false
 		}
 	}
@@ -561,11 +586,25 @@ func (sm *shardManagerImpl) DeliverMessagesToShardOwner(
 
 	// Try local delivery first
 	if ch, ok := proxy.GetRemoteSendChan(targetShard); ok {
-		select {
-		case ch <- *routedMsg:
-			logger.Info("Delivered messages to local shard owner")
+		delivered := false
+		func() {
+			defer func() {
+				if panicErr := recover(); panicErr != nil {
+					logger.Warn("Failed to deliver messages to local shard owner (channel closed)")
+				}
+			}()
+			select {
+			case ch <- *routedMsg:
+				logger.Info("Delivered messages to local shard owner")
+				delivered = true
+			case <-shutdownChan.Channel():
+				// Shutdown signal received
+			}
+		}()
+		if delivered {
 			return true
-		case <-shutdownChan.Channel():
+		}
+		if shutdownChan.IsShutdown() {
 			return false
 		}
 	}
@@ -687,7 +726,8 @@ func (sd *shardDelegate) NotifyMsg(data []byte) {
 			localShard, ok := sd.manager.localShards[ClusterShardIDtoShortString(msg.ClientShard)]
 			if ok {
 				if localShard.Created.Before(msg.Timestamp) {
-					sd.manager.UnregisterShard(msg.ClientShard)
+					// Force unregister the local shard by passing its own timestamp
+					sd.manager.UnregisterShard(msg.ClientShard, localShard.Created)
 				}
 			}
 		}
@@ -718,15 +758,17 @@ func (sd *shardDelegate) MergeRemoteState(buf []byte, join bool) {
 		tag.NewStringTag("state", fmt.Sprintf("%+v", state)))
 }
 
-func (sm *shardManagerImpl) addLocalShard(shard history.ClusterShardID) {
+func (sm *shardManagerImpl) addLocalShard(shard history.ClusterShardID) time.Time {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 
 	key := ClusterShardIDtoShortString(shard)
-	sm.localShards[key] = ShardInfo{ID: shard, Created: time.Now()}
+	now := time.Now()
+	sm.localShards[key] = ShardInfo{ID: shard, Created: now}
 
 	// Update metrics
 	metrics.ShardDistributionGauge.WithLabelValues(sm.config.NodeName).Set(float64(len(sm.localShards)))
+	return now
 }
 
 func (sm *shardManagerImpl) removeLocalShard(shard history.ClusterShardID) {
@@ -784,8 +826,8 @@ type noopShardManager struct{}
 
 func (nsm *noopShardManager) Start() error                                        { return nil }
 func (nsm *noopShardManager) Stop()                                               {}
-func (nsm *noopShardManager) RegisterShard(history.ClusterShardID)                {}
-func (nsm *noopShardManager) UnregisterShard(history.ClusterShardID)              {}
+func (nsm *noopShardManager) RegisterShard(history.ClusterShardID) time.Time      { return time.Now() }
+func (nsm *noopShardManager) UnregisterShard(history.ClusterShardID, time.Time)   {}
 func (nsm *noopShardManager) GetShardOwner(history.ClusterShardID) (string, bool) { return "", false }
 func (nsm *noopShardManager) GetProxyAddress(string) (string, bool)               { return "", false }
 func (nsm *noopShardManager) IsLocalShard(history.ClusterShardID) bool            { return true }
@@ -820,10 +862,26 @@ func (nsm *noopShardManager) SetOnRemoteShardChange(handler func(peer string, sh
 func (nsm *noopShardManager) DeliverAckToShardOwner(srcShard history.ClusterShardID, routedAck *RoutedAck, proxy *Proxy, shutdownChan channel.ShutdownOnce, logger log.Logger, ack int64, allowForward bool) bool {
 	if proxy != nil {
 		if ackCh, ok := proxy.GetLocalAckChan(srcShard); ok {
-			select {
-			case ackCh <- *routedAck:
+			delivered := false
+			func() {
+				defer func() {
+					if panicErr := recover(); panicErr != nil {
+						if logger != nil {
+							logger.Warn("Failed to deliver ACK to local shard owner (channel closed)")
+						}
+					}
+				}()
+				select {
+				case ackCh <- *routedAck:
+					delivered = true
+				case <-shutdownChan.Channel():
+					// Shutdown signal received
+				}
+			}()
+			if delivered {
 				return true
-			case <-shutdownChan.Channel():
+			}
+			if shutdownChan.IsShutdown() {
 				return false
 			}
 		}
@@ -834,10 +892,26 @@ func (nsm *noopShardManager) DeliverAckToShardOwner(srcShard history.ClusterShar
 func (nsm *noopShardManager) DeliverMessagesToShardOwner(targetShard history.ClusterShardID, routedMsg *RoutedMessage, proxy *Proxy, shutdownChan channel.ShutdownOnce, logger log.Logger) bool {
 	if proxy != nil {
 		if ch, ok := proxy.GetRemoteSendChan(targetShard); ok {
-			select {
-			case ch <- *routedMsg:
+			delivered := false
+			func() {
+				defer func() {
+					if panicErr := recover(); panicErr != nil {
+						if logger != nil {
+							logger.Warn("Failed to deliver messages to local shard owner (channel closed)")
+						}
+					}
+				}()
+				select {
+				case ch <- *routedMsg:
+					delivered = true
+				case <-shutdownChan.Channel():
+					// Shutdown signal received
+				}
+			}()
+			if delivered {
 				return true
-			case <-shutdownChan.Channel():
+			}
+			if shutdownChan.IsShutdown() {
 				return false
 			}
 		}

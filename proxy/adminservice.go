@@ -261,23 +261,23 @@ func ClusterShardIDtoShortString(sd history.ClusterShardID) string {
 }
 
 func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
-	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
+	streamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 ) (retError error) {
 	defer log.CapturePanic(s.logger, &retError)
 
-	targetMetadata, ok := metadata.FromIncomingContext(targetStreamServer.Context())
+	targetMetadata, ok := metadata.FromIncomingContext(streamServer.Context())
 	if !ok {
 		return serviceerror.NewInvalidArgument("missing cluster & shard ID metadata")
 	}
 	clientShardID, serverShardID, err := history.DecodeClusterShardMD(
-		headers.NewGRPCHeaderGetter(targetStreamServer.Context()),
+		headers.NewGRPCHeaderGetter(streamServer.Context()),
 	)
 	if err != nil {
 		return err
 	}
 
 	// Detect intra-proxy streams early for logging/behavior toggles
-	isIntraProxy := common.IsIntraProxy(targetStreamServer.Context())
+	isIntraProxy := common.IsIntraProxy(streamServer.Context())
 
 	logger := log.With(s.logger,
 		tag.NewStringTag("client", ClusterShardIDtoString(clientShardID)),
@@ -338,19 +338,19 @@ func (s *adminServiceProxyServer) StreamWorkflowReplicationMessages(
 	}
 
 	if isIntraProxy {
-		return s.streamIntraProxyRouting(logger, targetStreamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
+		return s.streamIntraProxyRouting(logger, streamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
 	}
 
 	if s.Config.ShardCountConfig.Mode == config.ShardCountRouting {
-		return s.streamRouting(logger, targetStreamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
+		return s.streamRouting(logger, streamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
 	}
 
-	return s.streamForwarding(logger, targetStreamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
+	return s.streamForwarding(logger, streamServer, targetMetadata, clientShardID, serverShardID, directionLabel)
 }
 
 func (s *adminServiceProxyServer) streamForwarding(
 	logger log.Logger,
-	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
+	sourceStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 	targetMetadata metadata.MD,
 	clientShardID history.ClusterShardID,
 	serverShardID history.ClusterShardID,
@@ -359,7 +359,7 @@ func (s *adminServiceProxyServer) streamForwarding(
 	logger.Info("streamForwarding started")
 	defer logger.Info("streamForwarding finished")
 
-	outgoingContext := metadata.NewOutgoingContext(targetStreamServer.Context(), targetMetadata)
+	outgoingContext := metadata.NewOutgoingContext(sourceStreamServer.Context(), targetMetadata)
 	outgoingContext, cancel := context.WithCancel(outgoingContext)
 	defer cancel()
 
@@ -375,7 +375,7 @@ func (s *adminServiceProxyServer) streamForwarding(
 		directionLabel,
 		clientShardID,
 		serverShardID,
-		targetStreamServer,
+		sourceStreamServer,
 		sourceStreamClient,
 		shutdownChan,
 	)
@@ -385,7 +385,7 @@ func (s *adminServiceProxyServer) streamForwarding(
 
 func (s *adminServiceProxyServer) streamIntraProxyRouting(
 	logger log.Logger,
-	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
+	streamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 	targetMetadata metadata.MD,
 	clientShardID history.ClusterShardID,
 	serverShardID history.ClusterShardID,
@@ -396,7 +396,7 @@ func (s *adminServiceProxyServer) streamIntraProxyRouting(
 
 	// Determine remote peer identity from intra-proxy headers
 	peerNodeName := ""
-	if md, ok := metadata.FromIncomingContext(targetStreamServer.Context()); ok {
+	if md, ok := metadata.FromIncomingContext(streamServer.Context()); ok {
 		vals := md.Get(common.IntraProxyOriginProxyIDHeader)
 		if len(vals) > 0 {
 			peerNodeName = vals[0]
@@ -429,7 +429,7 @@ func (s *adminServiceProxyServer) streamIntraProxyRouting(
 
 	shutdownChan := channel.NewShutdownOnce()
 	go func() {
-		if err := sender.Run(targetStreamServer, shutdownChan); err != nil {
+		if err := sender.Run(streamServer, shutdownChan); err != nil {
 			logger.Error("intraProxyStreamSender.Run error", tag.Error(err))
 		}
 	}()
@@ -443,7 +443,7 @@ func (s *adminServiceProxyServer) streamIntraProxyRouting(
 // shard ownership and paired stream lifecycle management.
 func (s *adminServiceProxyServer) streamRouting(
 	logger log.Logger,
-	targetStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
+	sourceStreamServer adminservice.AdminService_StreamWorkflowReplicationMessagesServer,
 	targetMetadata metadata.MD,
 	targetShardID history.ClusterShardID,
 	sourceShardID history.ClusterShardID,
@@ -486,7 +486,7 @@ func (s *adminServiceProxyServer) streamRouting(
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		proxyStreamSender.Run(targetStreamServer, shutdownChan)
+		proxyStreamSender.Run(sourceStreamServer, shutdownChan)
 	}()
 	go func() {
 		defer wg.Done()
