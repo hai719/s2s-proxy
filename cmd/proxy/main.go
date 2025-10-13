@@ -105,16 +105,23 @@ func handleDebugConnections(w http.ResponseWriter, r *http.Request, proxyInstanc
 
 	// Get connection information from the proxy
 	if proxyInstance != nil {
+		// logger.Info("Getting connection info from proxy")
 		connections = proxyInstance.GetConnectionInfo()
+		// logger.Info("Getting connection info from proxy")
 		shardInfo = proxyInstance.GetShardInfo()
+		// logger.Info("Getting shard info from proxy")
 		channelInfo = proxyInstance.GetChannelInfo()
 	}
 
 	// Get active streams information
+	// logger.Info("Getting active streams from proxy")
 	streamTracker := proxy.GetGlobalStreamTracker()
+	// logger.Info("Getting active streams from proxy")
 	activeStreams = streamTracker.GetActiveStreams()
+	// logger.Info("Getting stream count from proxy")
 	streamCount = streamTracker.GetStreamCount()
 
+	// logger.Info("Creating debug response")
 	response := DebugResponse{
 		Timestamp:     time.Now(),
 		Connections:   connections,

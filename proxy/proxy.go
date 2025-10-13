@@ -222,6 +222,8 @@ func (ps *ProxyServer) start() error {
 	clientConfig := ps.config.Client
 
 	go func() {
+		ps.logger.Info("Starting ProxyServer")
+		defer ps.logger.Info("ProxyServer started")
 		for {
 			// If using mux transport underneath, Open call will be blocked until
 			// underlying connection is established.
@@ -433,6 +435,7 @@ func (s *Proxy) startMetricsHandler(cfg config.MetricsConfig) error {
 }
 
 func (s *Proxy) Start() error {
+	s.logger.Info("Starting Proxy")
 	if s.config.HealthCheck != nil {
 		if err := s.startHealthCheckHandler(*s.config.HealthCheck); err != nil {
 			return err
@@ -477,10 +480,12 @@ func (s *Proxy) Start() error {
 		}
 	}
 
+	s.logger.Info("Proxy started")
 	return nil
 }
 
 func (s *Proxy) Stop() {
+	s.logger.Info("Stopping Proxy")
 	if s.healthCheckServer != nil {
 		// Close without waiting for in-flight requests to complete.
 		_ = s.healthCheckServer.Close()
@@ -500,6 +505,7 @@ func (s *Proxy) Stop() {
 
 	// Stop shard manager
 	s.shardManager.Stop()
+	s.logger.Info("Proxy stopped")
 }
 
 // GetConnectionInfo returns debug information about active connections

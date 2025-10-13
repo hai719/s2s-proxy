@@ -108,6 +108,8 @@ func (tm *TransportManager) OpenServer(serverConfig config.ProxyServerConfig) (S
 }
 
 func (tm *TransportManager) Start() error {
+	tm.logger.Info("Starting TransportManager")
+	defer tm.logger.Info("TransportManager started")
 	for _, cm := range tm.muxConnManagers {
 		if err := cm.start(); err != nil {
 			return err
@@ -118,6 +120,8 @@ func (tm *TransportManager) Start() error {
 }
 
 func (tm *TransportManager) Stop() {
+	tm.logger.Info("Stopping TransportManager")
+	defer tm.logger.Info("TransportManager stopped")
 	for _, cm := range tm.muxConnManagers {
 		cm.stop()
 	}

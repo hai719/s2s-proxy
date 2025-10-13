@@ -369,8 +369,8 @@ func (s *adminServiceProxyServer) streamForwarding(
 		return err
 	}
 
-	forwarder := &proxyStreamForwarder{logger: logger, cancel: cancel}
 	shutdownChan := channel.NewShutdownOnce()
+	forwarder := &proxyStreamForwarder{logger: logger, cancel: cancel}
 	forwarder.Run(
 		directionLabel,
 		clientShardID,
@@ -406,10 +406,13 @@ func (s *adminServiceProxyServer) streamIntraProxyRouting(
 	// Only allow intra-proxy when at least one shard is local to this proxy instance
 	isLocalClient := s.shardManager.IsLocalShard(clientShardID)
 	isLocalServer := s.shardManager.IsLocalShard(serverShardID)
-	if (isLocalClient && isLocalServer) || (!isLocalClient && !isLocalServer) {
+	if isLocalClient || !isLocalServer {
 		logger.Info("Skipping intra-proxy between two local shards or two remote shards. Client may use outdated shard info.",
 			tag.NewStringTag("client", ClusterShardIDtoString(clientShardID)),
-			tag.NewStringTag("server", ClusterShardIDtoString(serverShardID)))
+			tag.NewStringTag("server", ClusterShardIDtoString(serverShardID)),
+			tag.NewBoolTag("isLocalClient", isLocalClient),
+			tag.NewBoolTag("isLocalServer", isLocalServer),
+		)
 		return nil
 	}
 
@@ -425,7 +428,11 @@ func (s *adminServiceProxyServer) streamIntraProxyRouting(
 	}
 
 	shutdownChan := channel.NewShutdownOnce()
-	go sender.Run(targetStreamServer, shutdownChan)
+	go func() {
+		if err := sender.Run(targetStreamServer, shutdownChan); err != nil {
+			logger.Error("intraProxyStreamSender.Run error", tag.Error(err))
+		}
+	}()
 
 	<-shutdownChan.Channel()
 	return nil
