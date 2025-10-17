@@ -730,7 +730,21 @@ func (m *intraProxyManager) ReconcilePeerStreams(
 		}
 	}
 
-	m.logger.Info("ReconcilePeerStreams", tag.NewStringTag("desiredReceivers", fmt.Sprintf("%v", desiredReceivers)))
+	// Build desiredSenders set: inverted direction of desiredReceivers
+	// Senders exist when remote shard is the target and local shard is the source
+	desiredSenders := make(map[peerStreamKey]string)
+	for _, l := range localShards {
+		for peer, shards := range remoteShards {
+			for _, r := range shards.Shards {
+				if l.ClusterID == r.ID.ClusterID {
+					continue
+				}
+				desiredSenders[peerStreamKey{targetShard: r.ID, sourceShard: l}] = peer
+			}
+		}
+	}
+
+	m.logger.Info("ReconcilePeerStreams", tag.NewStringTag("desiredReceivers", fmt.Sprintf("%v", desiredReceivers)), tag.NewStringTag("desiredSenders", fmt.Sprintf("%v", desiredSenders)))
 
 	// Ensure all desired receivers exist
 	for key := range desiredReceivers {
@@ -738,23 +752,37 @@ func (m *intraProxyManager) ReconcilePeerStreams(
 	}
 
 	// Prune anything not desired
-	check := func(ps *peerState) {
+	check := func(peer string, ps *peerState) {
 		// Collect keys to close for receivers
+		var receiversToClose []peerStreamKey
 		for key := range ps.receivers {
 			if _, ok2 := desiredReceivers[key]; !ok2 {
-				m.closePeerShardLocked(peerNodeName, ps, key)
+				receiversToClose = append(receiversToClose, key)
 			}
+		}
+		for _, key := range receiversToClose {
+			m.closePeerShardLocked(peer, ps, key)
+		}
+		// Collect keys to close for senders
+		var sendersToClose []peerStreamKey
+		for key := range ps.senders {
+			if _, ok2 := desiredSenders[key]; !ok2 {
+				sendersToClose = append(sendersToClose, key)
+			}
+		}
+		for _, key := range sendersToClose {
+			m.closePeerShardLocked(peer, ps, key)
 		}
 	}
 
 	m.streamsMu.Lock()
 	if peerNodeName != "" {
 		if ps, ok := m.peers[peerNodeName]; ok && ps != nil {
-			check(ps)
+			check(peerNodeName, ps)
 		}
 	} else {
-		for _, ps := range m.peers {
-			check(ps)
+		for peer, ps := range m.peers {
+			check(peer, ps)
 		}
 	}
 	m.streamsMu.Unlock()
